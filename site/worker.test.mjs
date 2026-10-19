@@ -141,7 +141,11 @@ test("home: / sends a browser that prefers Chinese, Japanese or German to its pa
   assert.equal(await to({ "Accept-Language": "de-AT" }), "/de/");
   assert.equal(await to({ "Accept-Language": "de", Cookie: "lang=en" }), null);
   assert.equal(await to({ Cookie: "lang=de" }), "/de/");
-  for (const lang of ["zh", "de"]) {
+  assert.equal(await to({ "Accept-Language": "es-419,es;q=0.9,en;q=0.8" }), "/es/");
+  assert.equal(await to({ "Accept-Language": "es-MX" }), "/es/");
+  assert.equal(await to({ "Accept-Language": "es", Cookie: "lang=en" }), null);
+  assert.equal(await to({ Cookie: "lang=es" }), "/es/");
+  for (const lang of ["zh", "de", "es"]) {
     const res = await worker.fetch(new Request("https://usemagpie.ai/" + lang), env, ctx);
     assert.equal(res.status, 301);
     assert.equal(new URL(res.headers.get("Location")).pathname, `/${lang}/`);

@@ -52,8 +52,19 @@ var trayDe = map[string]string{
 	"Restart Now to Update (%d in flight)": "Jetzt neu starten und aktualisieren (%d laufend)",
 }
 
+// trayEs is the tray menu in Spanish.
+var trayEs = map[string]string{
+	"Open magpie":                          "Abrir magpie",
+	"Version %s":                           "Versión %s",
+	"Restart to Update":                    "Reiniciar para actualizar",
+	"Restart to Update to %s":              "Reiniciar para actualizar a %s",
+	"Quit magpie":                          "Salir de magpie",
+	"Restart Now to Update":                "Reiniciar ahora para actualizar",
+	"Restart Now to Update (%d in flight)": "Reiniciar ahora para actualizar (%d en curso)",
+}
+
 // trayWords are the tray menu's translations by language.
-var trayWords = map[string]map[string]string{"zh": trayZh, "zh-TW": trayZhTW, "ja": trayJa, "de": trayDe}
+var trayWords = map[string]map[string]string{"zh": trayZh, "zh-TW": trayZhTW, "ja": trayJa, "de": trayDe, "es": trayEs}
 
 // onLang relabels the tray menu when the Settings page changes the
 // language; set by the process that has the tray.
@@ -65,7 +76,7 @@ var onLang func()
 // Simplified for any other zh, Japanese for any ja, German for any de.
 func trayLang(pref string, system func() string) string {
 	switch pref {
-	case "en", "zh", "zh-TW", "ja", "de":
+	case "en", "zh", "zh-TW", "ja", "de", "es":
 		return pref
 	}
 	switch sys := strings.ReplaceAll(strings.ToLower(system()), "_", "-"); {
@@ -77,6 +88,8 @@ func trayLang(pref string, system func() string) string {
 		return "ja"
 	case strings.HasPrefix(sys, "de"):
 		return "de"
+	case strings.HasPrefix(sys, "es"):
+		return "es"
 	}
 	return "en"
 }
@@ -97,7 +110,7 @@ func zhTraditional(sys string) bool {
 // asks for the Chinese ones.
 func notesLang(lang string) string {
 	switch lang {
-	case "de":
+	case "de", "es":
 		return "en"
 	case "zh-TW":
 		return "zh"

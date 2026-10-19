@@ -18465,7 +18465,7 @@ function viaText(v) {
 }
 
 const THEMES = [["system", "System"], ["light", "Light"], ["dark", "Dark"]];
-const LOCALES = [["system", "System"], ["en", "English"], ["zh", "简体中文"], ["zh-TW", "繁體中文"], ["ja", "日本語"], ["de", "Deutsch"]];
+const LOCALES = [["system", "System"], ["en", "English"], ["zh", "简体中文"], ["zh-TW", "繁體中文"], ["ja", "日本語"], ["de", "Deutsch"], ["es", "Español"]];
 const TRAYS = [["panel", "Open the quick panel"], ["window", "Open the main window"]];
 const CURRENCIES = [["usd", "$ USD"], ["cny", "¥ CNY"]];
 // The text size is the windows' own zoom, as a browser's Ctrl/Cmd +: the
