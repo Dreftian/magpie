@@ -1,0 +1,55 @@
+name: Build Windows Release
+
+on:
+  push:
+    branches: [ feat/i18n-es-latam ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build Windows Binary
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build Windows binary
+        shell: bash
+        run: |
+          go run github.com/tc-hib/go-winres@v0.3.3 make --in build/windows/winres.json --arch amd64 --out rsrc --file-version "0.1.0" --product-version "0.1.0"
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -tags production -trimpath -ldflags="-s -w -H windowsgui" -o magpie-windows-amd64.exe .
+          rm -f rsrc_windows_*.syso
+
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: magpie-windows-amd64
+          path: magpie-windows-amd64.exe
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v0.1.0-es-latam
+          name: "Magpie v0.1.0 (Español Latinoamérica)"
+          body: |
+            ## Magpie con soporte completo para Español de Latinoamérica (es-419)
+
+            Esta versión incluye la localización completa al español implementada en la rama `feat/i18n-es-latam`:
+            - **3,701 claves de interfaz de usuario** traducidas al español latinoamericano.
+            - **4 plugins completos:** Library, Routing, Usage y Sessions.
+            - Menú de la bandeja del sistema (Tray), notificaciones de tareas terminadas, alertas de cuota/saldo y avisos de WebView2.
+
+            ### Instrucciones de uso en Windows:
+            1. Descarga `magpie-windows-amd64.exe` adjunto abajo.
+            2. Cierra la versión de Magpie que tengas abierta actualmente.
+            3. Ejecuta este nuevo archivo `magpie-windows-amd64.exe`.
+            4. En **Settings → General → Language**, selecciona **Español** (o déjalo en **System** si tu Windows está en español).
+          files: magpie-windows-amd64.exe
