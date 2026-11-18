@@ -241,7 +241,7 @@ func CheckInMiniMax(ctx context.Context) []WorkBuddyCheckin {
 // MiniMaxCheckins is each MiniMax Code account's last check-in, as kept,
 // by its name now; asks nothing.
 func MiniMaxCheckins() []WorkBuddyCheckin {
-	st := readCheckins(miniMaxCheckinPath())
+	st := shownCheckins(miniMaxCheckinPath())
 	var out []WorkBuddyCheckin
 	listed := map[string]bool{}
 	for _, a := range miniMaxCheckinAccounts() {
@@ -313,5 +313,5 @@ func miniMaxSiteAccounts(site string, pp plugin.Provider) []miniMaxAccount {
 // KeepMiniMaxCheckedIn checks the MiniMax Code accounts in each day while
 // settings say to, as KeepTraeCheckedIn does Trae CN's.
 func KeepMiniMaxCheckedIn(ctx context.Context) {
-	keepCheckedIn(ctx, "minimax", newMiniMaxCheckiner(miniMaxCheckinAccounts), func() bool { return settings.Load().MiniMaxCheckin })
+	keepCheckedIn(ctx, "minimax", newMiniMaxCheckiner(miniMaxCheckinAccounts), func() bool { return settings.Shared().MiniMaxCheckin })
 }

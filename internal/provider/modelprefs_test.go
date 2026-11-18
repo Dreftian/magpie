@@ -94,7 +94,7 @@ func TestModelName(t *testing.T) {
 	if b.Name != "Sol" || b.Default != "" || b.Label() != "Sol · B" {
 		t.Fatalf("%+v %q", b, b.Label())
 	}
-	if g := entry(t, "group/auto-sol"); g.Name != "Sol" {
+	if g := entry(t, "auto/sol"); g.Name != "Sol" {
 		t.Fatalf("the group took a provider's name: %+v", g)
 	}
 	if p, m, ok := Resolve("a/sol"); !ok || p.ID != "a" || m != "sol" {
@@ -170,7 +170,7 @@ func TestModelEfforts(t *testing.T) {
 	if got := entry(t, "b/sol").Efforts; !slices.Equal(got, []string{"low", "medium", "high", "max"}) {
 		t.Fatal(got)
 	}
-	if got := entry(t, "group/auto-sol").Efforts; !slices.Equal(got, []string{"low", "high"}) {
+	if got := entry(t, "auto/sol").Efforts; !slices.Equal(got, []string{"low", "high"}) {
 		t.Fatal(got)
 	}
 	// the vendor is still asked at any level it has
@@ -741,6 +741,7 @@ func TestUpstreamNameAsGivesAModelTheNameItWasGiven(t *testing.T) {
 // really went out — read against the family, every level of it reads as
 // another model answering.
 func TestSentNameInAsksForTheVariantTheEffortPicks(t *testing.T) {
+	t.Cleanup(AntigravityBuiltinForTest()) // the retired built-in route
 	prefsHome(t)
 	// Antigravity's ids of one model at three levels, as its fetch left them
 	if err := os.MkdirAll(filepath.Dir(catalog.LivePath("antigravity")), 0o755); err != nil {
@@ -785,6 +786,7 @@ func TestSentNameInAsksForTheVariantTheEffortPicks(t *testing.T) {
 // built by (codeAssistID) and the rule a ledger reads a record back against
 // are one rule, and these are the two ends of it.
 func TestSentNameInAsksAVariantIdForWhatTheEffortPicks(t *testing.T) {
+	t.Cleanup(AntigravityBuiltinForTest()) // the retired built-in route
 	prefsHome(t)
 	// one model at three levels, and one at two, so a family's default is
 	// the top of it in one case and not the other
@@ -841,6 +843,7 @@ func TestSentNameInAsksAVariantIdForWhatTheEffortPicks(t *testing.T) {
 // magpie knows, which is what the gateway's own dispatch (codeAssistID) reads
 // the same way.
 func TestSentNameIsJudgedByTheAccountAndNotByTheProviderId(t *testing.T) {
+	t.Cleanup(AntigravityBuiltinForTest()) // the retired built-in route
 	prefsHome(t)
 	if err := os.MkdirAll(filepath.Dir(catalog.LivePath("antigravity")), 0o755); err != nil {
 		t.Fatal(err)

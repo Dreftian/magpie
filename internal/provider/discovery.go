@@ -13,7 +13,9 @@
 // kept of its own (logins.json, plugin-auth.json) is left as it is, unread
 // and unwritten, and comes back when discovery is turned on again.
 // Middleware plugins and Pi extensions in the plugin host are not
-// subscriptions and run as before.
+// subscriptions and run as before, and neither is a public plugin, one
+// whose every way in is keyless (publicPlugin): it holds no account of
+// the user's, so it is listed, signed in and served (lileo0668).
 
 package provider
 
@@ -24,7 +26,7 @@ import (
 	"github.com/yetone/magpie/internal/settings"
 )
 
-var errAccountDiscoveryOff = errors.New("subscription accounts are off in magpie (Settings → Privacy, or `magpie accounts discovery on`)")
+var errAccountDiscoveryOff = errors.New("subscription accounts are off in magpie (Settings › Privacy, or `magpie accounts discovery on`)")
 
 // discoveryOff is whether agents' sign-ins are left unread; see above.
 func discoveryOff() bool { return settings.AccountDiscoveryOff() }

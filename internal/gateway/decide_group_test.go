@@ -8,7 +8,9 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
+	"github.com/yetone/magpie/internal/access"
 	"github.com/yetone/magpie/internal/provider"
 )
 
@@ -245,5 +247,98 @@ func TestDecisionProviderKeysFailOver(t *testing.T) {
 				t.Fatalf("classifier after the rest asked %v, want c2 first", asked)
 			}
 		})
+	}
+}
+
+// A decision model's keys share the one classifier's wait, as Settings
+// says it is given, its failover included: a key that never answers
+// spends it, and the next is not asked with a whole wait of its own. Each
+// try given the whole wait held a request a wait per key before routing
+// it (Jason on Discord, held 2m and stopped with a 504).
+func TestDecisionTriesShareTheClassifierWait(t *testing.T) {
+	fresh(t)
+	was := classifyUnit
+	classifyUnit = 20 * time.Millisecond // the 15 seconds unset are 300ms
+	t.Cleanup(func() { classifyUnit = was })
+	var mu sync.Mutex
+	var asked []string
+	stop := make(chan struct{})
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		asked = append(asked, strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
+		mu.Unlock()
+		// never answers: the body read, so a client gone ends r's context
+		io.Copy(io.Discard, r.Body)
+		select {
+		case <-r.Context().Done():
+		case <-stop:
+		}
+	}))
+	t.Cleanup(up.Close)
+	t.Cleanup(func() { close(stop) }) // runs before up.Close
+	if err := provider.Save(provider.Provider{ID: "jw", Name: "JW", Key: "w1", Keys: []provider.KeyAccount{{Key: "w2"}, {Key: "w3"}}, Decide: up.URL + "/v1"}); err != nil {
+		t.Fatal(err)
+	}
+	s := New()
+	_, err := s.askClassifier("jw/jev-latest", []string{"feature", "bug"}, before{}, false, "fix this")
+	if err == nil || !strings.Contains(err.Error(), "no answer in 300ms") {
+		t.Fatalf("a decision model that never answers: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(asked) != 1 {
+		t.Fatalf("asked %v in one classifier's wait, want the first key alone", asked)
+	}
+}
+
+// A gateway key held to some models reaches a decision group at
+// /v1/systemone when it names the group (Kautism on Discord: the key
+// editor now offers it), every member through it; a key naming only a
+// chat model is refused it, and asks none of its models.
+func TestGatewayKeyNamingADecisionGroup(t *testing.T) {
+	fresh(t)
+	f := &decideFleet{status: map[string]int{}}
+	a := f.serve()
+	defer a.Close()
+	up := httptest.NewServer(&fake{t: t, ctype: "application/json", reply: `{"id":"x","choices":[]}`})
+	defer up.Close()
+	for _, p := range []provider.Provider{
+		{ID: "relay", Name: "Relay", Key: "k", Chat: up.URL + "/v1", Models: []string{"m"}},
+		{ID: "ja", Name: "JA", Key: "ka", Decide: a.URL + "/v1"},
+	} {
+		if err := provider.Save(p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := provider.SaveGroup(provider.Group{ID: "jevs", Name: "Jevs", Members: []string{"ja/jev-latest"}}); err != nil {
+		t.Fatal(err)
+	}
+	keys, secrets := newCaller(t, "Given the group", "A chat model only")
+	for i, ms := range [][]string{{"group/jevs"}, {"relay/m"}} {
+		if _, err := access.Update("models-key", access.Change{Key: keys[i].ID, Models: ms}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	h := New().Handler()
+	ask := func(secret, model string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest("POST", "/v1/systemone", strings.NewReader(`{"model":"`+model+`","state":{"message":"hi"},"questions":{"intent":{"type":"choice"}}}`))
+		r.Header.Set("Authorization", "Bearer "+secret)
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		return w
+	}
+	for _, model := range []string{"group/jevs", "Jevs"} {
+		if w := ask(secrets[0], model); w.Code != 200 || !strings.Contains(w.Body.String(), `"choice":"bug"`) {
+			t.Fatalf("%s for the key naming it: %d %s", model, w.Code, w.Body)
+		}
+	}
+	if got := len(f.took()); got != 2 {
+		t.Fatalf("asked %d times, want 2", got)
+	}
+	if w := ask(secrets[1], "group/jevs"); w.Code != 403 {
+		t.Fatalf("a key not naming the group: %d %s", w.Code, w.Body)
+	}
+	if got := f.took(); len(got) != 0 {
+		t.Fatalf("a refused key's request asked %v", got)
 	}
 }

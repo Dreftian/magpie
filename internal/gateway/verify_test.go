@@ -77,3 +77,58 @@ func TestVerifyRefusalFallsBack(t *testing.T) {
 		t.Fatal("any 403 read as a verification")
 	}
 }
+
+// Google's link reaches the agent and the Routing page's Verify whole: every
+// query parameter, its & unescaped, whether the body wrote & or &.
+func TestVerifyLinkWhole(t *testing.T) {
+	const link = "https://accounts.google.com/signin/continue?sarp=1&scc=1&continue=https://developers.google.com/gemini-code-assist/auth/auth_success_gemini%3Fsrc%3Dag&plt=AKgnsbvK-3x_Yq9Zt0lPq2vN7m8w&flowName=GlifWebSignIn&authuser=0"
+	for _, amp := range []string{"&", `&`} {
+		fresh(t)
+		u := strings.ReplaceAll(link, "&", amp)
+		body := `{"error":{"code":403,"message":"Verify your account to continue.","status":"PERMISSION_DENIED","details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"VALIDATION_REQUIRED","domain":"cloudcode-pa.googleapis.com","metadata":{"validation_error_message":"Verify your account to continue.","validation_url_link_text":"Verify your account","validation_url":"` + u + `"}},{"@type":"type.googleapis.com/google.rpc.Help","links":[{"description":"Further action is required to use this service. Navigate to the following URL to complete verification:\n\n` + u + `\n\nLearn more:\n\nhttps://support.google.com/accounts?p=al_alert\n","url":"` + u + `"},{"description":"Learn more","url":"https://support.google.com/accounts?p=al_alert"}]}]}}`
+		a := &scripted{replies: []reply{{403, "application/json", body}}}
+		scriptedOn(t, "a", provider.Chat, a)
+		s := New()
+		_, got := postAs(t, s, "", `{"model":"a/m","messages":[{"role":"user","content":"hi"}]}`)
+		if msg := provider.APIError([]byte(got), ""); !strings.Contains(msg, " open "+link+" in a browser") {
+			t.Fatalf("%s: %s", amp, msg)
+		}
+		if l, _ := provider.Verification([]byte(got)); l != link {
+			t.Fatalf("%s: read back %q", amp, l)
+		}
+		r := s.trace.routes[len(s.trace.routes)-1]
+		if rest := r.Tries[len(r.Tries)-1].Rest; rest == nil || rest.Link != link {
+			t.Fatalf("%s: rest %+v", amp, rest)
+		}
+	}
+}
+
+// The agy-cli plugin (plugins packages/agy-cli, usage.mjs verifyRefused)
+// turns agy's bare "Verification Required" ending (kidgpt on X, 11-16) into
+// a 403 in these words: the gateway reads them as Google's verification
+// refusal, rests the account as "verify" with the link when there is one,
+// and passes the words on once, not with its own advice added again.
+func TestAgyCLIVerifyWords(t *testing.T) {
+	const link = "https://accounts.google.com/signin/continue?sarp=1&scc=1&plt=AKgnsbv"
+	const said = `agy bridge: Google wants this account verified before Antigravity serves it again (agy: \"Verification Required\") — this Google account needs to be verified: `
+	for _, c := range []struct{ tail, link string }{
+		{"open " + link + " in a browser signed in to it, verify it, then try again", link},
+		{"open the Antigravity app, or run `agy` in a terminal, signed in to it and do what it asks, then try again", ""},
+	} {
+		fresh(t)
+		body := `{"type":"error","error":{"type":"permission_error","message":"` + said + c.tail + `"}}`
+		a := &scripted{replies: []reply{{403, "application/json", body}}}
+		scriptedOn(t, "a", provider.Chat, a)
+		s := New()
+		code, got := postAs(t, s, "", `{"model":"a/m","messages":[{"role":"user","content":"hi"}]}`)
+		msg := provider.APIError([]byte(got), "")
+		if code != 403 || strings.Count(msg, "needs to be verified") != 1 || !strings.HasSuffix(msg, c.tail) {
+			t.Fatalf("%d: %s", code, msg)
+		}
+		r := s.trace.routes[len(s.trace.routes)-1]
+		try := r.Tries[len(r.Tries)-1]
+		if try.Fail != failVerify || try.Rest == nil || try.Rest.By != "verify" || try.Rest.Link != c.link {
+			t.Fatalf("try %+v rest %+v", try, try.Rest)
+		}
+	}
+}

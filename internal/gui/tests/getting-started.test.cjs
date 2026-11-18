@@ -7,6 +7,11 @@
 // models in a click. Each step is ticked from the state the server gives,
 // never from having been seen; the card goes once the first two are done,
 // and put away it stays away, kept in the settings, not the page's storage.
+// Renzexi01 on X (一进来就这么复杂): while the card shows, the agents'
+// list is folded under it, behind "Show all {n} agents", since its second
+// step names the ones found here; one connected, or the card put away,
+// and the list is in view as before. Put away, its line says Settings ›
+// General brings it back, and a row there does (the window).
 // Both engines, a wide and a narrow window and the panel, every language.
 // No backend, the API is faked here.
 const assert = require("node:assert/strict");
@@ -55,6 +60,7 @@ function server(lang, w, posts) {
     if (url.pathname === "/wails/runtime.js") return route.fulfill({ contentType: "text/javascript", body: "export const Window = {};" });
     if (req.method() === "POST") posts.push(url.pathname + url.search);
     if (url.pathname === "/api/state") return json(state());
+    if (url.pathname === "/api/settings") return json(settings());
     if (url.pathname === "/api/settings/guide") {
       w.hidden = !!req.postDataJSON().hidden;
       return json(settings());
@@ -96,14 +102,19 @@ async function open(browser, layout, lang, w, posts) {
   await context.addInitScript(() => { try { localStorage.setItem("magpie.panelTab", "agents"); } catch {} });
   const page = await context.newPage();
   page.setDefaultTimeout(5000);
+  page.setDefaultNavigationTimeout(60000);
   page.errors = [];
   page.on("pageerror", (e) => page.errors.push(e.message));
   await page.route("**/*", server(lang, w, posts));
   await page.goto("http://magpie.test" + layout.url);
-  await page.locator(".row.agent").first().waitFor();
+  // folded under Get started, the rows are there but out of view
+  await page.locator(".row.agent").first().waitFor({ state: "attached" });
   return { context, page };
 }
 
+// the agents' rows in view, not folded under the list's Show more
+const inView = (page) => page.locator(".row.agent").evaluateAll((rs) => rs.filter((r) => !r.closest(".agent-fold")).map((r) => r.dataset.id || r.id));
+const folded = (page) => page.locator(".agent-fold .row.agent").count();
 const stepDone = (page, step) => page.locator(`.guide-step[data-step="${step}"]`).evaluate((e) => e.classList.contains("done"));
 const tops = (page) => page.evaluate(() => [document.scrollingElement.scrollTop, document.querySelector("#view-agents")?.scrollTop]);
 const sideways = (page) => page.evaluate(() => {
@@ -138,6 +149,15 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         assert.ok(await page.locator(".guide-agent").evaluateAll((bs) => bs.every((b) => b.disabled)));
         // routing waits for a model source: no button yet
         assert.equal(await page.locator(".guide-tpl").count(), 0);
+        // the card alone, the list folded under it
+        assert.deepEqual(await inView(page), [], "no agent row in view under Get started");
+        assert.equal(await folded(page), 5);
+        if (layout.name !== "panel") {
+          const more = page.locator(".agent-more");
+          assert.equal((await more.textContent()).trim(), await tr("Show all {n} agents", { n: 5 }));
+          if (lang !== "en") assert.notEqual(await tr("Show all {n} agents"), "Show all {n} agents", `${lang} has "Show all {n} agents"`);
+          assert.equal(await more.getAttribute("aria-expanded"), "false");
+        }
         assert.equal(await sideways(page), false, "nothing runs off sideways");
         if (shots && (lang === "en" || lang === "zh")) await page.screenshot({ path: path.join(shots, `getting-started-${engine}-${lang}-${layout.name}-new.png`) });
 
@@ -184,10 +204,12 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         assert.deepEqual(await tops(page), before, "no click moved the page");
         assert.equal(top[0], before[0]);
 
-        // done stays done: a reload brings no card back
+        // done stays done: a reload brings no card back, and the agent
+        // connected is in view, the rest folded as for anyone
         await page.goto("http://magpie.test" + layout.url);
         await page.locator(".row.agent").first().waitFor();
         assert.equal(await page.locator(".guide").count(), 0);
+        assert.equal(await folded(page), 4);
         assert.deepEqual(page.errors, []);
       });
 
@@ -203,6 +225,9 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await page.locator(".guide").waitFor({ state: "detached" });
         assert.ok(posts.includes("/api/settings/guide"));
         assert.equal(w.hidden, true);
+        assert.equal(await page.locator("#status").textContent(), await page.evaluate(() => t("Get started hidden; Settings › General brings it back")));
+        // put away, the list is in view as it was before there was a card
+        assert.equal(await folded(page), 0);
         assert.deepEqual(await tops(page), top, "no click moved the page");
         assert.deepEqual(page.errors, []);
         await first.context.close();
@@ -214,6 +239,29 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         assert.equal(await again.page.locator(".guide").count(), 0);
         assert.equal(await again.page.evaluate(() => { try { return Object.keys(localStorage).filter((k) => /guide/i.test(k)).length; } catch { return 0; } }), 0, "nothing kept in localStorage");
         assert.deepEqual(again.page.errors, []);
+        if (layout.name === "panel") return;
+
+        // and brought back from Settings › General, where its hide said:
+        // a row there only while it is away and would show
+        const pg = again.page, tr = (s) => pg.evaluate((s) => t(s), s);
+        await pg.goto("http://magpie.test/?view=settings&tab=general");
+        const back = pg.locator("#guideBackRow");
+        await back.locator("button").waitFor();
+        assert.equal(await back.locator(".name").textContent(), await tr("Get started"));
+        // Settings' search finds it by its name
+        await pg.locator("#setQ").fill((await tr("Get started")).toLowerCase());
+        await pg.waitForTimeout(150);
+        assert.ok(await back.isVisible(), "the search finds the row");
+        await pg.locator("#setQ").fill("");
+        const before = await pg.locator("#view-settings").evaluate((v) => v.scrollTop);
+        await back.locator("button").click();
+        await back.waitFor({ state: "hidden" });
+        assert.equal(w.hidden, false);
+        assert.equal(await pg.locator("#status").textContent(), await tr("Get started is back on the Agents page"));
+        assert.equal(await pg.locator("#view-settings").evaluate((v) => v.scrollTop), before, "no click moved the page");
+        await pg.goto("http://magpie.test" + layout.url);
+        await pg.locator("#agentsLead .guide").waitFor();
+        assert.deepEqual(pg.errors, []);
       });
     }
   }

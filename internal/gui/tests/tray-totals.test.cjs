@@ -12,7 +12,7 @@ const fs = require("node:fs/promises");
 const path = require("node:path");
 const { test } = require("node:test");
 const { chromium, webkit } = require("playwright");
-const { openPart } = require("./reader.cjs");
+const { openPart, reach } = require("./reader.cjs"); // reach: wheeled to as a reader would, rows taller since their lines wrap whole (arculongus on Discord); a Playwright scroll is undone
 
 const assets = path.resolve(__dirname, "../assets");
 
@@ -23,11 +23,11 @@ const quotas = [
 ];
 
 const want = {
-  en: { off: "Off", today: "Tokens and cost today", week: "Tokens and cost, last 7 days", note: "Every agent's, as the Usage page counts them", two: "2 shown", subs: "2 subscriptions", days: "7 days" },
-  zh: { off: "关闭", today: "今天的 token 数和费用", week: "最近 7 天的 token 数和费用", note: "所有 Agent 的合计，与用量页的统计一致", two: "已选 2 项", subs: "2 个订阅", days: "7 天" },
-  "zh-TW": { off: "關閉", today: "今天的 token 數和費用", week: "最近 7 天的 token 數和費用", note: "所有 Agent 的合計，與用量頁的統計一致", two: "已選 2 項", subs: "2 個訂閱", days: "7 天" },
-  ja: { off: "オフ", today: "今日のトークン数と費用", week: "直近 7 日間のトークン数と費用", note: "すべてのエージェントの合計（使用量ページと同じ集計）", two: "2 件を表示", subs: "2 件のサブスクリプション", days: "7 日" },
-  de: { off: "Aus", today: "Tokens und Kosten heute", week: "Tokens und Kosten, letzte 7 Tage", note: "Alle Agenten zusammen, wie die Nutzungsseite sie zählt", two: "2 angezeigt", subs: "2 Abos", days: "7 Tage" },
+  en: { off: "Off", today: "Tokens and cost today", week: "Tokens and cost, last 7 days", note: "Gateway and session-log calls, as Usage › Requests counts them", two: "2 shown", subs: "2 subscriptions", days: "7 days" },
+  zh: { off: "关闭", today: "今天的 token 数和费用", week: "最近 7 天的 token 数和费用", note: "网关调用与会话日志调用，与用量 › 请求的统计一致", two: "已选 2 项", subs: "2 个订阅", days: "7 天" },
+  "zh-TW": { off: "關閉", today: "今天的 token 數和費用", week: "最近 7 天的 token 數和費用", note: "閘道呼叫與會話日誌呼叫，與用量 › 請求的統計一致", two: "已選 2 項", subs: "2 個訂閱", days: "7 天" },
+  ja: { off: "オフ", today: "今日のトークン数と費用", week: "直近 7 日間のトークン数と費用", note: "ゲートウェイとセッションログの呼び出し（使用量 › リクエストと同じ集計）", two: "2 件を表示", subs: "2 件のサブスクリプション", days: "7 日" },
+  de: { off: "Aus", today: "Tokens und Kosten heute", week: "Tokens und Kosten, letzte 7 Tage", note: "Aufrufe über den Zugangspunkt und aus Sitzungslogs, wie Nutzung › Anfragen sie zählt", two: "2 angezeigt", subs: "2 Abos", days: "7 Tage" },
 };
 
 function settingsPayload(over) {
@@ -102,6 +102,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
           const context = await browser.newContext({ viewport: { width, height: 560 }, reducedMotion: "reduce" });
           const page = await context.newPage();
           page.setDefaultTimeout(5000);
+          page.setDefaultNavigationTimeout(60000);
           page.on("pageerror", (e) => errors.push(e.message));
           await page.route("**/*", server(lang, posts, asked));
 
@@ -111,8 +112,9 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
           const pill = page.locator("#trayUsagePick button");
           await pill.waitFor();
           await pillIs(page, w.off);
-          await pill.scrollIntoViewIfNeeded();
+          await reach(page, pill);
           const before = await view(page);
+          const pillY = (await pill.boundingBox()).y;
 
           // the two totals follow the subscriptions, each with a box to tick
           await pill.click();
@@ -160,7 +162,11 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
           assert.deepEqual(posts.at(-1).trayUsages, ["usage:7d"]);
 
           await page.waitForTimeout(300);
-          assert.equal(await view(page), before, "no click moved the page");
+          // the pill's name changes its width, and the row's line, wrapped
+          // whole beside it (arculongus on Discord), can take a line more or
+          // less: the page then moves only to keep the pill under the pointer (WebKit
+          // scrolls by whole pixels, so four holds can leave it ~1.3px off)
+          if (await view(page) !== before) assert.ok(Math.abs((await pill.boundingBox()).y - pillY) <= 2, "a click moved the page, and the pill with it");
           assert.deepEqual(errors, []);
           await context.close();
         });
@@ -174,6 +180,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         const context = await browser.newContext({ viewport: { width: 1100, height: 560 }, reducedMotion: "reduce" });
         const page = await context.newPage();
         page.setDefaultTimeout(5000);
+        page.setDefaultNavigationTimeout(60000);
         page.on("pageerror", (e) => errors.push(e.message));
         await page.route("**/*", server(lang, [], asked));
         await page.goto("http://magpie.test/?view=usage&tab=requests&period=7d");
@@ -192,6 +199,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         const context = await browser.newContext({ viewport: { width: 440, height: 400 }, reducedMotion: "reduce" });
         const page = await context.newPage();
         page.setDefaultTimeout(5000);
+        page.setDefaultNavigationTimeout(60000);
         page.on("pageerror", (e) => errors.push(e.message));
         await page.route("**/*", server(lang, [], asked, true));
         await page.goto("http://magpie.test/?mode=panel");

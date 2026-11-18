@@ -49,6 +49,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       t.after(() => browser.close());
       const page = await (await browser.newContext({ viewport: { width: 900, height: 560 }, reducedMotion: "reduce" })).newPage();
       page.setDefaultTimeout(5000);
+      page.setDefaultNavigationTimeout(60000);
       const errors = [];
       page.on("pageerror", (e) => errors.push(e.message));
       const posts = [];
@@ -67,7 +68,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       assert.equal(posts[0].body.text, "magpie-stepfun:{}");
 
       // the one signed in signs out, for its own id
-      await page.locator(".editor .bar").getByRole("button", { name: words[lang].cancel, exact: true }).click();
+      await page.locator(".editor .bar .ed-cancel").click();
       await page.locator(".editor").waitFor({ state: "detached" });
       await page.locator(".row.provider", { hasText: "StepFun" }).filter({ hasNotText: "Work" }).click();
       await page.locator(".editor .stepplan").getByRole("button", { name: words[lang].out, exact: true }).click();

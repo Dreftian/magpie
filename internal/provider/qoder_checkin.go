@@ -223,7 +223,7 @@ func CheckInQoder(ctx context.Context) []WorkBuddyCheckin {
 // QoderCheckins is each Qoder account's last check-in, as kept, by its
 // name now; asks nothing.
 func QoderCheckins() []WorkBuddyCheckin {
-	st := readCheckins(qoderCheckinPath())
+	st := shownCheckins(qoderCheckinPath())
 	var out []WorkBuddyCheckin
 	listed := map[string]bool{}
 	for _, a := range qoderCheckinAccounts() {
@@ -286,5 +286,5 @@ func qoderCheckinAccounts() []qoderCheckinAcct {
 // KeepQoderCheckedIn checks the Qoder accounts in each day while settings
 // say to, as KeepTraeCheckedIn does Trae CN's.
 func KeepQoderCheckedIn(ctx context.Context) {
-	keepCheckedIn(ctx, "qoder", newQoderCheckiner(qoderCheckinAccounts, time.Now), func() bool { return settings.Load().QoderCheckin })
+	keepCheckedIn(ctx, "qoder", newQoderCheckiner(qoderCheckinAccounts, time.Now), func() bool { return settings.Shared().QoderCheckin })
 }

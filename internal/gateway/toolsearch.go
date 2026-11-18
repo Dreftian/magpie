@@ -22,7 +22,7 @@ import (
 // no tool_search_call turns the whole request away (#1171 tcxp001, the
 // compaction on Anyrouter; #1755 FivePink, Xiaomi MiMo).
 func searchAsFunction(body []byte) ([]byte, bool) {
-	if !bytes.Contains(body, []byte(`"tool_search`)) {
+	if !bodyHas(body, `"tool_search`) {
 		return body, false
 	}
 	dec := json.NewDecoder(bytes.NewReader(body))
@@ -106,6 +106,9 @@ func undefer(tm map[string]any) {
 
 // marshalPlain is json.Marshal leaving <, > and & as they are.
 func marshalPlain(v any) ([]byte, error) {
+	if b, ok := marshalRaw(v, false); ok {
+		return b, nil
+	}
 	var b bytes.Buffer
 	enc := json.NewEncoder(&b)
 	enc.SetEscapeHTML(false)
@@ -140,7 +143,7 @@ func (t *searchTidy) flush() []byte {
 }
 
 func searchLines(b []byte) []byte {
-	if !bytes.Contains(b, []byte(`"tool_search"`)) {
+	if !bodyHas(b, `"tool_search"`) {
 		return append([]byte(nil), b...)
 	}
 	var out []byte
@@ -157,7 +160,7 @@ func searchLines(b []byte) []byte {
 }
 
 func searchLine(line []byte) []byte {
-	if !bytes.Contains(line, []byte(`"tool_search"`)) {
+	if !bodyHas(line, `"tool_search"`) {
 		return line
 	}
 	body := bytes.TrimRight(line, "\r\n")

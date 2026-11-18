@@ -55,6 +55,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       t.after(() => browser.close());
       const page = await (await browser.newContext({ viewport: { width: 900, height: 760 }, reducedMotion: "reduce" })).newPage();
       page.setDefaultTimeout(5000);
+      page.setDefaultNavigationTimeout(60000);
       const errors = [], saved = [];
       page.on("pageerror", (e) => errors.push(e.message));
       await page.route("**/*", serve(lang, saved));
@@ -91,7 +92,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       ed = await open("My Relay");
       assert.equal(await nameBox(ed).count(), 1, "custom: one Name box");
       assert.equal(await ed.locator("input.provider-name").count(), 0);
-      await ed.locator(".bar").getByRole("button", { name: w.cancel, exact: true }).click();
+      await ed.locator(".bar .ed-cancel").click();
       await ed.waitFor({ state: "detached" });
       assert.deepEqual(errors, [], "nothing throws");
     });

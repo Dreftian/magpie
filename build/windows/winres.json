@@ -1,13 +1,13 @@
 {
   "RT_GROUP_ICON": {
     "#3": {
-      "0000": ["icon-256.png", "icon-128.png", "icon-64.png", "icon-48.png", "icon-32.png", "icon-16.png"]
+      "0000": ["icon-256.png", "icon-128.png", "icon-64.png", "icon-48.png", "icon-40.png", "icon-32.png", "icon-24.png", "icon-20.png", "icon-16.png"]
     }
   },
   "RT_MANIFEST": {
     "#1": {
       "0409": {
-        "identity": { "name": "ai.usemagpie.magpie", "version": "" },
+        "identity": { "name": "ai.usemagpie.magpie", "version": "1.0.0.0" },
         "description": "magpie",
         "minimum-os": "win10",
         "execution-level": "as invoker",
@@ -29,14 +29,16 @@
   "RT_VERSION": {
     "#1": {
       "0000": {
-        "fixed": { "file_version": "0.0.0.0", "product_version": "0.0.0.0" },
+        "fixed": { "file_version": "1.0.0.0", "product_version": "1.0.0.0" },
         "info": {
           "0409": {
             "CompanyName": "magpie",
             "FileDescription": "magpie",
+            "FileVersion": "1.0.0",
             "LegalCopyright": "© 2026 yetone · MIT",
             "OriginalFilename": "magpie.exe",
-            "ProductName": "magpie"
+            "ProductName": "magpie",
+            "ProductVersion": "1.0.0"
           }
         }
       }

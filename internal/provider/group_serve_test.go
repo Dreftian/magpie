@@ -20,8 +20,8 @@ func TestOwnGroupsWaitOnThePlugin(t *testing.T) {
 		t.Fatal(err)
 	}
 	entries := []Entry{
-		{ID: "a/x", Model: "x", Provider: Provider{ID: "a"}}, {ID: "b/y", Model: "y", Provider: Provider{ID: "b"}},
-		{ID: "a/m", Model: "m", Provider: Provider{ID: "a"}}, {ID: "b/m", Model: "m", Provider: Provider{ID: "b"}},
+		{ID: "a/x", Model: "x", Provider: &Provider{ID: "a"}}, {ID: "b/y", Model: "y", Provider: &Provider{ID: "b"}},
+		{ID: "a/m", Model: "m", Provider: &Provider{ID: "a"}}, {ID: "b/m", Model: "m", Provider: &Provider{ID: "b"}},
 	}
 	listed := func() []string {
 		var ids []string
@@ -31,7 +31,7 @@ func TestOwnGroupsWaitOnThePlugin(t *testing.T) {
 		slices.Sort(ids)
 		return ids
 	}
-	both, found := []string{"group/auto-m", "group/mine"}, []string{"group/auto-m"}
+	both, found := []string{"auto/m", "group/mine"}, []string{"auto/m"}
 	check := func(when string, want []string) {
 		t.Helper()
 		if got := listed(); !slices.Equal(got, want) {
@@ -81,7 +81,7 @@ func TestOwnGroupRefreshesTheGate(t *testing.T) {
 	t.Setenv("HOME", home)
 	t.Setenv("USERPROFILE", home)
 	t.Setenv("XDG_CONFIG_HOME", "")
-	entries := []Entry{{ID: "a/m", Model: "m", Provider: Provider{ID: "a"}}, {ID: "b/m", Model: "m", Provider: Provider{ID: "b"}}}
+	entries := []Entry{{ID: "a/m", Model: "m", Provider: &Provider{ID: "a"}}, {ID: "b/m", Model: "m", Provider: &Provider{ID: "b"}}}
 	asked := 0
 	var remove func()
 	defer func() {

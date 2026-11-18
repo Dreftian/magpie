@@ -32,6 +32,52 @@ func (p Provider) PluginConcurrency() int {
 	return max(p.Account.plugin.MaxConcurrency, 0)
 }
 
+// AtOnce is how many of the provider's accounts or keys take requests at
+// the same time, 0 for no limit: the user's MaxAccounts when they set one,
+// else what the plugin giving the provider says (its auth hook's
+// maxAccounts, or its package.json's magpie.maxAccounts), else none. An
+// account not had from All or AlsoOn carries none of the provider's
+// settings: they are read from providers.json then.
+func (p Provider) AtOnce() int {
+	n := p.MaxAccounts
+	if n == nil && p.Account != nil {
+		if s, ok := storedPicks(p.ID); ok {
+			n = s.MaxAccounts
+		}
+	}
+	if n != nil {
+		return min(max(*n, 0), MaxLimit)
+	}
+	return p.PluginAtOnce()
+}
+
+// PluginAtOnce is how many of its accounts the plugin giving the provider
+// says may take requests at the same time, as it lists it now; 0 for none,
+// or for a provider no plugin gives.
+func (p Provider) PluginAtOnce() int {
+	if !p.IsPlugin() {
+		return 0
+	}
+	if cur, ok := PluginOf(p.ID); ok {
+		return min(max(cur.MaxAccounts, 0), MaxLimit)
+	}
+	return min(max(p.Account.plugin.MaxAccounts, 0), MaxLimit)
+}
+
+// SetAtOnce sets how many of the provider's accounts or keys take requests
+// at the same time: 0 for no limit, nil for what its plugin says.
+func SetAtOnce(id string, n *int) error {
+	if n != nil && (*n < 0 || *n > MaxLimit) {
+		return fmt.Errorf("accounts at once is from 0 (no limit) to %d, not %d", MaxLimit, *n)
+	}
+	p, err := Find(id)
+	if err != nil {
+		return err
+	}
+	p.MaxAccounts = n
+	return Save(*p)
+}
+
 // One account's or key's own limit (#892: a Claude account kept to two
 // at once while the provider's others take more), the queue's bound and
 // how long a request waits in it. The limit is the lane's — the account
@@ -183,6 +229,38 @@ func normalAccountConcurrency(m map[string]int) map[string]int {
 
 // MaxRPMLimit bounds a limit on requests a minute.
 const MaxRPMLimit = 10000
+
+// MaxImagesLimit bounds a limit on the images one request may carry. No
+// vendor lists more than a few hundred, and a number past this is a typo
+// rather than a cap.
+const MaxImagesLimit = 1000
+
+// normalMaxImages is a MaxImages as saved: model ids trimmed, each cap held
+// to 1..MaxImagesLimit, a cap of 0 or less (none) and an empty id dropped.
+func normalMaxImages(m map[string]int) map[string]int {
+	var out map[string]int
+	for id, n := range m {
+		id = strings.TrimSpace(id)
+		if id == "" || n <= 0 {
+			continue
+		}
+		if out == nil {
+			out = map[string]int{}
+		}
+		out[id] = min(n, MaxImagesLimit)
+	}
+	return out
+}
+
+// ImageCapOf is the most images one request to model may carry, as the
+// user set it on p: the model's own, else the one for all its models, 0
+// for none.
+func (p Provider) ImageCapOf(model string) int {
+	if n := p.MaxImages[model]; n > 0 {
+		return n
+	}
+	return p.MaxImages["*"]
+}
 
 // RPMLimit is how many requests a minute each of p's keys or accounts may
 // send the vendor, 0 for no limit: the provider's MaxRPM. An account not

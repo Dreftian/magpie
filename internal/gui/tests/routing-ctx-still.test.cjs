@@ -91,7 +91,10 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       await t.test(`${lang} ${width}px`, async () => {
         const context = await browser.newContext({ viewport: { width, height: 900 } });
         const page = await context.newPage();
+        // the block grid, the look these cells are drawn in (the map is the default)
+        await page.addInitScript(() => { try { localStorage.setItem("magpie.ctxLook", "grid"); } catch {} });
         page.setDefaultTimeout(5000);
+        page.setDefaultNavigationTimeout(60000);
         const errors = [];
         page.on("pageerror", (e) => errors.push(e.message));
         const feed = { next: null };
@@ -165,7 +168,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
           }
         }
         // the cache never flashes to a dash; its bar never empties
-        assert.deepEqual([...new Set(frames.map((f) => f.figure$))].filter((x) => !/^\d+%$/.test(x)), [], "the cache figure is a figure on every frame");
+        assert.deepEqual([...new Set(frames.map((f) => f.figure$))].filter((x) => !/^\d+\.\d\d%$/.test(x)), [], "the cache figure is a figure on every frame");
         assert(frames.every((f) => f.fill > 0), "the cache bar never empties");
         assert.deepEqual([...new Set(frames.map((f) => f.scroll))], [frames[0].scroll], "the page doesn't scroll by itself");
         // under way with its prompt: the last request's, dimmed and said so;

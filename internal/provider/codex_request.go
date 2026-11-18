@@ -9,14 +9,15 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/codexcat"
+	"github.com/yetone/magpie/internal/lazyre"
 	"github.com/yetone/magpie/internal/proc"
 )
 
@@ -39,12 +40,11 @@ func codexSign(token func(context.Context) (tok, accountID string, err error)) f
 			req.Header.Set("chatgpt-account-id", accountID)
 		}
 		req.Header.Set("OpenAI-Beta", "responses=experimental")
-		req.Header.Set("originator", "codex_cli_rs")
 		// the version and the User-Agent name one Codex, never older than
 		// the client whose request this is (its version header, relayed)
 		ver := newerVersion(codexVersion(), req.Header.Get("version"))
 		req.Header.Set("version", ver)
-		req.Header.Set("User-Agent", codexUserAgent(ver))
+		codexClientHeaders(req.Header, ver)
 		if body == nil {
 			return nil
 		}
@@ -52,6 +52,63 @@ func codexSign(token func(context.Context) (tok, accountID string, err error)) f
 		sessionHeaders(req.Header, body)
 		return nil
 	}
+}
+
+// codexClientHeaders are what every request Codex CLI makes carries,
+// whatever it is for: its originator and its User-Agent, naming Codex of
+// version ver (codex-rs login/src/auth/default_client.rs default_headers,
+// which its token refresh, its /wham reads and its model requests are all
+// sent with). The ChatGPT account's own calls that aren't a model's
+// (/wham/usage, the reset credits, the token refresh) went with Go's
+// User-Agent and no originator, unlike any request Codex makes.
+//
+// Which Codex that is is settings.CodexClient's: Codex CLI by default, the
+// Codex app when the user chose it (ouhthuo on X: the backend routes some
+// models by the client's originator).
+func codexClientHeaders(h http.Header, ver string) {
+	if CodexClient() == "desktop" {
+		h.Set("originator", codexDesktopOriginator)
+		h.Set("User-Agent", codexDesktopUserAgent(ver))
+		return
+	}
+	h.Set("originator", "codex_cli_rs")
+	h.Set("User-Agent", codexUserAgent(ver))
+}
+
+// codexDesktopOriginator is the originator the Codex app gives
+// (set_default_originator, which codex-rs login/src/auth/default_client.rs
+// turns into the first word of the User-Agent as well); its threads record
+// the same name.
+const codexDesktopOriginator = "Codex Desktop"
+
+// codexDesktopBuild is the app's own version, the last part of the
+// User-Agent it sends, from the app's logs (26.1026.10807 is the newest
+// build seen); its codex-rs version is ver.
+const codexDesktopBuild = "26.1026.10807"
+
+// codexDesktopUserAgent is the User-Agent the Codex app of codex-rs version
+// v sends: "Codex Desktop/0.166.0 (Mac OS 26.6.0; arm64) unknown (Codex
+// Desktop; 26.1026.10807)". The terminal is "unknown" on every system,
+// since the app has none.
+func codexDesktopUserAgent(v string) string {
+	ua := codexUserAgent(v)
+	if i := strings.Index(ua, ") "); i >= 0 {
+		ua = ua[:i+2]
+	}
+	return codexDesktopOriginator + strings.TrimPrefix(ua, "codex_cli_rs") + "unknown (" + codexDesktopOriginator + "; " + codexDesktopBuild + ")"
+}
+
+// codexAccountHeaders are the headers of a call Codex makes about the
+// ChatGPT account (its /wham reads): the account it is about and
+// codexClientHeaders. Codex sends no version header with them.
+func codexAccountHeaders(accountID string) map[string]string {
+	h := http.Header{}
+	codexClientHeaders(h, codexVersion())
+	m := map[string]string{"chatgpt-account-id": accountID}
+	for k := range h {
+		m[k] = h.Get(k)
+	}
+	return m
 }
 
 // sessionHeaders names the conversation body belongs to (its
@@ -95,7 +152,7 @@ func codexUserAgent(v string) string {
 	return "codex_cli_rs/" + v + " (" + codexUA.os + "; " + arch + ") " + term
 }
 
-var versionRE = regexp.MustCompile(`\d+(\.\d+)+`)
+var versionRE = lazyre.New(`\d+(\.\d+)+`)
 
 // codexOS names the system as Codex CLI does: "Mac OS 26.6.0",
 // "Windows 10.0.26100", "Linux 6.8.0".
@@ -229,7 +286,8 @@ var savedPrompts, codexCLIPrompts promptFile
 
 // codexInstructions is what Codex CLI would send as a model's
 // instructions: the account's model list's, Codex CLI's own copy of it
-// when magpie hasn't asked yet, else Codex's generic prompt.
+// when magpie hasn't asked yet, else its bundled catalog's for the model,
+// or Codex's prompt for a model it doesn't know (codexcat.Official).
 func codexInstructions(model string) string {
 	if s, ok := savedPrompts.get(codexPromptsPath(), model, func(b []byte) map[string]string {
 		var m map[string]string
@@ -241,14 +299,14 @@ func codexInstructions(model string) string {
 	if s, ok := codexCLIPrompts.get(catalog.CodexModelsCache(), model, codexPrompts); ok {
 		return s
 	}
-	return codexcat.Prompt
+	return codexcat.Official(model)
 }
 
 // codexBody makes a Responses request the one Codex CLI would send: it
 // streams only, keeps nothing (so its items carry no ids), carries Codex's
 // instructions — the client's own riding first in the input — and rejects
 // the sampling knobs, explicit cache options and any service tier but
-// Fast's and Ultrafast's.
+// Fast's ("fast" sent as "priority") and Ultrafast's.
 func codexBody(body []byte) []byte {
 	dec := json.NewDecoder(bytes.NewReader(body))
 	dec.UseNumber()
@@ -264,8 +322,12 @@ func codexBody(body []byte) []byte {
 	for _, k := range []string{"max_output_tokens", "max_completion_tokens", "temperature", "top_p", "previous_response_id", "user", "safety_identifier", "prompt_cache_options"} {
 		delete(m, k)
 	}
-	// Codex's Fast mode sends "priority", its Ultrafast "ultrafast"; any
-	// other tier stays out
+	// Codex's Fast mode sends "priority", its Ultrafast "ultrafast"; its
+	// older word for Fast, "fast", goes as Codex sends it (Archivemylife
+	// on X); any other tier stays out
+	if m["service_tier"] == "fast" {
+		m["service_tier"] = "priority"
+	}
 	if t := m["service_tier"]; t != "priority" && t != "ultrafast" {
 		delete(m, "service_tier")
 	}
@@ -284,15 +346,29 @@ func codexBody(body []byte) []byte {
 	}
 
 	// the client's instructions go first as a developer message, Codex's
-	// in their place — unless they are Codex's, from Codex itself
-	codex := codexInstructions(model)
+	// in their place — unless they are Codex's, from Codex itself. A
+	// Responses Lite turn (Codex 0.165 on) carries its system prompt as
+	// developer items in input and no instructions at all; Codex's added
+	// to it sent the prompt twice, ~4K more input tokens a request
+	lite := strings.TrimSpace(own) == "" && codexLite(m, input)
+	codex := ""
+	if !lite {
+		codex = codexInstructions(model)
+	}
 	if strings.TrimSpace(own) != "" {
 		if firstLine(own) == firstLine(codex) {
 			codex = own
 		} else {
-			input = append([]any{map[string]any{"type": "message", "role": "developer",
-				"content": []any{map[string]any{"type": "input_text", "text": own}}}}, input...)
+			input = append([]any{DeveloperMessage(own)}, input...)
 		}
+	}
+	if codex != "" && InstructionsAfterInput(model) {
+		// GPT-6.2 reads top-level instructions after the input, so they
+		// went uncached every turn; they go first in the input, where
+		// Codex puts its own (BaseInstructionsFragment)
+		input = append([]any{DeveloperMessage(codex)}, input...)
+		codex = ""
+		delete(m, "instructions")
 	}
 	if input == nil {
 		input = []any{}
@@ -305,6 +381,9 @@ func codexBody(body []byte) []byte {
 	m["stream"] = true
 	m["tool_choice"] = "auto"
 	declareSearch(m, false)
+	// a call's name the backend refuses, in a history another provider's
+	// model wrote, turned the whole request away (codex_names.go)
+	codexToolNames(m)
 	if _, ok := m["parallel_tool_calls"]; !ok {
 		m["parallel_tool_calls"] = true
 	}
@@ -322,7 +401,7 @@ func codexBody(body []byte) []byte {
 	if effort == "none" {
 		delete(m, "include")
 	} else {
-		if reasoning != nil {
+		if reasoning != nil && !lite {
 			if _, ok := reasoning["summary"]; !ok {
 				reasoning["summary"] = "auto"
 			}
@@ -338,6 +417,40 @@ func codexBody(body []byte) []byte {
 		return body
 	}
 	return out
+}
+
+// InstructionsAfterInput says model is one OpenAI reads a request's
+// top-level instructions for after its input, not before it: GPT-6.2 and
+// later ("Starting with GPT-6.2, models append top-level instructions
+// after input and bill those tokens at the uncached input rate",
+// developers.openai.com/api/docs/guides/prompt-caching). Sent so, they
+// end the prompt the cache keeps, and from the second turn on what is
+// cached ends where the last turn's input did: on a ChatGPT account
+// gpt-6.2-sol had 1,920 of 8,271 input tokens cached on a third turn with
+// Codex's instructions on top, 6,016 with them first in the input
+// (gpt-6-sol cached 5,632 of 6,843 with them on top). Such a model is
+// sent its instructions as a developer message first in the input, which
+// is where Codex puts its own on every model.
+func InstructionsAfterInput(model string) bool {
+	if i := strings.LastIndexByte(model, '/'); i >= 0 {
+		model = model[i+1:]
+	}
+	g := gptVersionRE.FindStringSubmatch(strings.ToLower(model))
+	if g == nil {
+		return false
+	}
+	major, _ := strconv.Atoi(g[1])
+	minor, _ := strconv.Atoi(g[2]) // "" (gpt-7) is 0
+	return major > 6 || major == 6 && minor >= 2
+}
+
+var gptVersionRE = lazyre.New(`^gpt-(\d+)(?:\.(\d+))?(?:$|-)`)
+
+// DeveloperMessage is text as a Responses developer message, as Codex
+// sends its base instructions in the input.
+func DeveloperMessage(text string) map[string]any {
+	return map[string]any{"type": "message", "role": "developer",
+		"content": []any{map[string]any{"type": "input_text", "text": text}}}
 }
 
 // conversationKey names the conversation a request belongs to, for a client
@@ -380,7 +493,8 @@ func BoundCallID(id string) string {
 }
 
 // codexInput makes input items fit a request that keeps nothing: no
-// references to stored items, no ids, a tool's output without its call
+// references to stored items, no ids (nor a message's status, which goes
+// with its id), a tool's output without its call
 // kept as a message saying what it was, and no system role, which the
 // backend rejects (developer keeps what it means in its place).
 func codexInput(input []any) []any {
@@ -422,6 +536,14 @@ func codexInput(input []any) []any {
 			continue
 		}
 		delete(it, "id")
+		// A message's status goes only with its id: without one, the
+		// backend reads it as an input message, which has no status, and
+		// turns the request away 400 "Unknown parameter: 'input[N].status'"
+		// (Doby on Discord: Pi gives each assistant message it sends again
+		// status "completed"). Codex's own reasoning items carry none.
+		if t := it["type"]; t == nil || t == "message" || t == "reasoning" {
+			delete(it, "status")
+		}
 		switch t, _ := it["type"].(string); t {
 		case "function_call_output", "custom_tool_call_output", "local_shell_call_output":
 			id, _ := it["call_id"].(string)
@@ -508,6 +630,20 @@ func DeclareSearch(body []byte, lite bool) []byte {
 // is taken as Lite, too, when it carries an additional_tools item or asks
 // for reasoning context "all_turns", which Lite requires; the backend takes
 // the item on a request that isn't Lite as well.
+// codexLite says m is a Responses Lite turn: Codex's own, with its tools
+// in an additional_tools item and reasoning over all turns.
+func codexLite(m map[string]any, input []any) bool {
+	if r, _ := m["reasoning"].(map[string]any); r["context"] == "all_turns" {
+		return true
+	}
+	for _, raw := range input {
+		if it, _ := raw.(map[string]any); it["type"] == "additional_tools" {
+			return true
+		}
+	}
+	return false
+}
+
 func declareSearch(m map[string]any, lite bool) bool {
 	input, ok := m["input"].([]any)
 	if !ok {
@@ -571,13 +707,37 @@ func declareSearch(m map[string]any, lite bool) bool {
 	return true
 }
 
-// declaresSearch says whether tools has a web search among them, by any of
-// its names (web_search, web_search_preview, a dated one).
+// declaresSearch says whether tools has a web search among them: the
+// hosted one by any of its names (web_search, web_search_preview, a dated
+// one), or Codex's own web.run, a function in the "web" namespace.
+//
+// Codex declares web.run in place of the hosted tool, never beside it: on a
+// model its catalog puts on Responses Lite, or with its standalone web
+// search on, it offers the function and leaves web_search out. The ChatGPT
+// backend refuses a request that carries both ("a single request can't
+// contain both a client-declared function web.run and the hosted tool
+// web_search", Savin on Discord, Codex 0.163.0-alpha), so a conversation
+// that replays an earlier web_search_call under web.run is sent as Codex
+// sent it, with no hosted tool added: web.run is the search the backend
+// serves it, through /alpha/search.
 func declaresSearch(tools []any) bool {
 	for _, raw := range tools {
 		t, _ := raw.(map[string]any)
-		if typ, _ := t["type"].(string); strings.HasPrefix(typ, "web_search") {
+		typ, _ := t["type"].(string)
+		name, _ := t["name"].(string)
+		switch {
+		case strings.HasPrefix(typ, "web_search"):
 			return true
+		case typ == "function" && name == "web.run":
+			return true
+		case typ == "namespace" && name == "web":
+			inner, _ := t["tools"].([]any)
+			for _, raw := range inner {
+				f, _ := raw.(map[string]any)
+				if f["type"] == "function" && f["name"] == "run" {
+					return true
+				}
+			}
 		}
 	}
 	return false

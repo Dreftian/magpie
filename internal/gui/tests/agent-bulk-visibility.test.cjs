@@ -12,6 +12,15 @@ const names = {
   ja: ['エージェントを一括管理', '選択項目を非表示', '選択項目の非表示を解除', '検索結果をすべて選択', '検索結果の選択を反転', '未接続のエージェントを選択', '選択を解除'],
   de: ['Agents verwalten', 'Auswahl ausblenden', 'Auswahl einblenden', 'Suchergebnisse auswählen', 'Auswahl der Suchergebnisse umkehren', 'Nicht verbundene Agents auswählen', 'Auswahl aufheben'],
 };
+// the note says what hiding changes: the Library stops listing the agent
+// too (shownAgents in plugins/library/client.js), it isn't only this list
+const notes = {
+  en: "Hiding leaves an agent's connection and settings as they are. The Library stops listing it too: what it gave the agent stays, and nothing new goes to it. Unhidden agents may stay under Not set up.",
+  zh: '隐藏不影响 Agent 的接入或设置。资源库也不再列出它：已给它的内容保留，新内容不会再给它。取消隐藏后，Agent 仍可能留在「未设置」中。',
+  'zh-TW': '隱藏不影響 Agent 的連線或設定。資源庫也不再列出它：已給它的內容保留，新內容不會再給它。取消隱藏後，Agent 仍可能留在「未設定」中。',
+  ja: '非表示にしても、エージェントの接続や設定は変わりません。ライブラリにも表示されなくなり、すでに渡したものは残り、新しいものは渡されません。非表示を解除しても「未設定」に残る場合があります。',
+  de: 'Ausblenden lässt Verbindung und Einstellungen eines Agents, wie sie sind. Auch die Bibliothek führt ihn nicht mehr auf: Was sie ihm gegeben hat, bleibt, Neues bekommt er nicht. Nach dem Einblenden können Agents unter „Nicht eingerichtet“ bleiben.',
+};
 for (const engine of process.env.BROWSER ? [process.env.BROWSER] : ['chromium', 'webkit']) {
   for (const lang of Object.keys(names)) {
     test(`${engine} ${lang}: bulk visibility, retry and persistence`, async (t) => {
@@ -19,6 +28,7 @@ for (const engine of process.env.BROWSER ? [process.env.BROWSER] : ['chromium', 
       t.after(() => browser.close());
       const page = await browser.newPage({ viewport: { width: lang === 'en' ? 1240 : 560, height: 760 }, reducedMotion: 'reduce' });
       page.setDefaultTimeout(5000);
+      page.setDefaultNavigationTimeout(60000);
       const agent = (id, wired = false) => ({ id, name: id, icon: 'generic', wired, fields: [{ key: 'model', label: 'model', value: wired ? 'relay/m1' : '', options: [{ value: 'relay/m1', label: 'm1', ref: 'relay/m1' }] }] });
       const theme = lang === 'de' ? 'dark' : 'light';
       const state = { agents: [agent('Codex', true), agent('Pi'), agent('Zed'), agent('Hidden')], profiles: [], settings: { lang, theme, agentOrder: ['Zed', 'Codex', 'Pi', 'Hidden'], agentsHidden: ['Hidden'] } };
@@ -28,7 +38,8 @@ for (const engine of process.env.BROWSER ? [process.env.BROWSER] : ['chromium', 
       await page.route('**/*', async (route) => {
         const req = route.request(), url = new URL(req.url());
         const json = (data) => route.fulfill({ json: data });
-        if (req.method() === 'POST') posts.push([url.pathname, req.postDataJSON()]);
+        // the window saying it is in use (update/using), or that it went from view (page-away), is not the page's doing
+        if (req.method() === 'POST' && url.pathname !== '/api/update/using' && url.pathname !== '/api/page-away') posts.push([url.pathname, req.postDataJSON()]);
         if (url.pathname === '/boot.js') return route.fulfill({ contentType: 'text/javascript', body: `window.bootPrefs = ${JSON.stringify({lang, theme, web:true})};` });
         if (url.pathname === '/wails/runtime.js') return route.fulfill({ contentType: 'text/javascript', body: 'export const Window = {};' });
         if (url.pathname === '/api/state') return json(state);
@@ -74,7 +85,26 @@ for (const engine of process.env.BROWSER ? [process.env.BROWSER] : ['chromium', 
       await page.getByRole('button', { name: manage, exact: true }).click();
       const dialog = page.getByRole('dialog'), search = dialog.locator('input[type=search]');
       const button = (name) => dialog.getByRole('button', { name, exact: true });
+      // the dialog is in agentsmanager.js, loaded when Manage is pressed
+      await dialog.getByRole('checkbox').first().waitFor();
       assert.equal(await dialog.getByRole('checkbox').count(), 4, 'hidden and folded agents are manageable');
+      assert.equal((await dialog.locator('.lib-confirm').textContent()).trim(), notes[lang]);
+      // a name's text sits beside its icon, not at the row's far end (the
+      // owner's screenshot: .editor label's right alignment reached the
+      // rows of a wide window), wide and narrow
+      for (const width of [1240, 560]) {
+        await page.setViewportSize({width, height:760});
+        await page.waitForFunction((w) => window.innerWidth === w, width);
+        const gaps = await dialog.locator('.ag-manage-row').evaluateAll((rows) => rows.map((r) => {
+          const range = document.createRange();
+          range.selectNodeContents(r.querySelector('.ag-manage-name'));
+          return Math.round(range.getBoundingClientRect().left - r.querySelector('.ic').getBoundingClientRect().right);
+        }));
+        assert(gaps.every((g) => g >= 4 && g <= 14), `name beside its icon at ${width}: ${gaps}`);
+        if (process.env.ROW_SHOT && lang === 'zh') await dialog.screenshot({path:`${process.env.ROW_SHOT}-${engine}-${width}.png`});
+      }
+      await page.setViewportSize({width:lang === 'en' ? 1240 : 560, height:760});
+      await page.waitForFunction((w) => window.innerWidth === w, lang === 'en' ? 1240 : 560);
       assert(await button(hide).isDisabled());
       await search.fill('not-an-agent');
       assert.equal(await dialog.getByRole('checkbox').count(), 0);

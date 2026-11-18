@@ -49,9 +49,9 @@ function server(lang, limited) {
 }
 
 const L = {
-  en: { installed: "Installed", check: "Check for updates", head: "No updates for the plugins checked · 1 couldn't be checked: ", none: /^Couldn't ask github:me\/opencode-x-auth for its newest commit: GitHub allows 60 requests an hour without a token, used up until \S+.* Add a GitHub token in Settings → Network and sharing/,
+  en: { installed: "Installed", check: "Check for updates", head: "No updates for the plugins checked · 1 couldn't be checked: ", none: /^Couldn't ask github:me\/opencode-x-auth for its newest commit: GitHub allows 60 requests an hour without a token, used up until \S+.* Add a GitHub token in Settings › Network and sharing/,
     token: /GitHub's rate limit for your GitHub token is used up for now$/, every: "Every plugin is up to date" },
-  zh: { installed: "已安装", check: "检查更新", head: "已检查的插件都没有更新 · 1 个无法检查：", none: /^没能向 github:me\/opencode-x-auth 查询最新提交：GitHub 不带令牌每小时仅允许 60 次请求，已用完，\S+ 恢复。在 设置 → 网络与共享 添加 GitHub 令牌/,
+  zh: { installed: "已安装", check: "检查更新", head: "已检查的插件都没有更新 · 1 个无法检查：", none: /^没能向 github:me\/opencode-x-auth 查询最新提交：GitHub 不带令牌每小时仅允许 60 次请求，已用完，\S+ 恢复。在 设置 › 网络与共享 添加 GitHub 令牌/,
     token: /你的 GitHub 令牌的请求额度暂时用完了$/, every: "所有插件都是最新的" },
   ja: { installed: "インストール済み", check: null, head: "確認できたプラグインに更新はありません · 1 個を確認できませんでした：", none: /^github:me\/opencode-x-auth の最新コミットを確認できませんでした：GitHub はトークンなしでは/,
     token: /GitHub トークンのレート制限は現在使い切られています$/, every: "すべてのプラグインが最新です" },
@@ -70,6 +70,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
           for (const [limited, want] of [[{ until: "2030-01-02T03:04:00Z" }, w.none], [{ token: true }, w.token]]) {
             const page = await (await browser.newContext({ viewport: { width, height: 640 } })).newPage();
             page.setDefaultTimeout(5000);
+            page.setDefaultNavigationTimeout(60000);
             const errors = [];
             page.on("pageerror", (e) => errors.push(e.message));
             await page.route("**/*", server(lang, limited));

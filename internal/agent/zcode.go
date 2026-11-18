@@ -2,14 +2,18 @@ package agent
 
 import (
 	"encoding/json"
+	"errors"
+	"io/fs"
 	"net"
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 
 	"github.com/yetone/magpie/internal/appdir"
+	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/edit"
 	"github.com/yetone/magpie/internal/gateway"
 )
@@ -22,7 +26,8 @@ import (
 //	  "options":{"apiKey":"magpie","baseURL":"http://127.0.0.1:3425"},
 //	  "enabled":true,"source":"custom",
 //	  "models":{"<id>":{"name":…,"limit":{"context":…,"output":…},"modalities":{…},
-//	    "reasoning":{"enabled":true,"variants":[…],"defaultVariant":…}}}}}}
+//	    "reasoning":{"enabled":true,"levels":[…],"defaultLevel":…,
+//	      "providerOptionsByLevel":{"<level>":{"thinking":{"type":"enabled","budget_tokens":…}}}}}}}}}
 //
 // An anthropic provider is asked at baseURL + /v1/messages. The model is
 // picked per task in ZCode's own picker and kept in its window, not in a
@@ -42,7 +47,7 @@ import (
 //	      "personalModelIds":[…],"modelOrder":[…]}}]},
 //	  "modelConfigRules":{"providerModelRules":[{"providerId":"magpie",
 //	    "modelId":…,"config":{"properties":{"contextWindow":…,
-//	      "inputFormat":{"supportsImage":…}},
+//	      "inputFormat":{"supportsImage":…},"supportsNativeWebSearch":true},
 //	      "optionSpecs":{"maxOutputTokens":{"max":…},"reasoningLevel":{"values":[…]}}}}],
 //	    "manualProviderModelRules":[…]}}}
 //
@@ -55,9 +60,14 @@ import (
 // files (zcodeFormat), and only a provider magpie adds new starts on
 // Anthropic Messages.
 
+// zcodeOS is the OS ZCode's home is found for, so a test can ask for
+// Windows' (appdir.ZCodeHomeOn).
+var zcodeOS = runtime.GOOS
+
 func zcode(home string) *Agent {
-	// where ZCode keeps its data, moved there in its settings or not
-	dir := filepath.Join(appdir.ZCodeDataIn(home), ".zcode")
+	// where ZCode keeps its data, moved there in its settings or not, under
+	// the home ZCode reads (HOME first, on Windows too)
+	dir := filepath.Join(appdir.ZCodeDataIn(appdir.ZCodeHomeOn(zcodeOS, home)), ".zcode")
 	path := filepath.Join(dir, "v2", "config.json")
 	rules := filepath.Join(dir, "v2", "provider_config.json")
 	key := "provider." + magpieID
@@ -103,6 +113,9 @@ func zcode(home string) *Agent {
 					return err
 				}
 				if v == "" {
+					if _, ok := stashShared()[zcodeSearchedKey]; ok {
+						forget(zcodeSearchedKey)
+					}
 					return edit.DelJSON(path, key)
 				}
 				return edit.SetJSON(path, edit.KV{Path: key, Value: zcodeProviderJSON(path, false)})
@@ -118,17 +131,15 @@ func zcode(home string) *Agent {
 // turned off in ZCode stays off. A sync (keep) leaves an address on another
 // machine as it found it (zcodeAddress).
 func zcodeProviderJSON(path string, keep bool) any {
-	was := zcodeVariants(path)
+	was, own := zcodeDefaultLevels(path), zcodeLevelOptions(path)
 	ms := map[string]any{}
-	for _, m := range magpieModels("zcode") {
+	format := zcodeFormat(filepath.Dir(path))
+	for _, m := range sharedModels("zcode") {
 		window := m.Context
 		if window == 0 {
-			window = 200000
+			window = unknownWindow(200000)
 		}
-		in := []string{"text"}
-		if m.Images {
-			in = append(in, "image")
-		}
+		in := zcodeInputs(m, format)
 		limit := map[string]any{"context": window}
 		// without it ZCode caps every reply at 32000 tokens
 		if out := outputOr(m, zcodeOutput(maxTokens(m))); out > 0 {
@@ -137,10 +148,13 @@ func zcodeProviderJSON(path string, keep bool) any {
 		e := map[string]any{"name": m.Name, "limit": limit,
 			"modalities": map[string]any{"input": in, "output": []string{"text"}}}
 		if levels := zcodeLevels(m.Efforts); levels != nil {
-			e["reasoning"] = map[string]any{"enabled": true, "variants": levels, "defaultVariant": keptEffort(was[m.ID], levels, zcodeDefaultLevel(levels))}
+			e["reasoning"] = map[string]any{"enabled": true, "levels": levels,
+				"defaultLevel":           keptEffort(was[m.ID], levels, zcodeDefaultLevel(levels)),
+				"providerOptionsByLevel": zcodeOptionsByLevel(levels, own[m.ID])}
 		}
 		ms[m.ID] = e
 	}
+	zcodeOutputsKept(path, ms)
 	on := true
 	if v, ok := edit.GetJSON(path, "provider."+magpieID+".enabled"); ok && v == "false" {
 		on = false
@@ -149,17 +163,76 @@ func zcodeProviderJSON(path string, keep bool) any {
 	if keep {
 		base, token = zcodeKept(filepath.Dir(path))
 	}
-	return map[string]any{"name": "magpie", "kind": zcodeKinds[zcodeFormat(filepath.Dir(path))], "enabled": on, "source": "custom",
+	return map[string]any{"name": "magpie", "kind": zcodeKinds[format], "enabled": on, "source": "custom",
 		"options": map[string]any{"apiKey": token, "baseURL": base}, "models": ms}
 }
 
-// zcodeVariants is the default variant each of magpie's models has in
-// config.json at path, which one set by hand keeps (keptEffort).
-func zcodeVariants(path string) map[string]string {
+// zcodeInputs are the kinds ZCode is told model m takes on format: text,
+// an image when it takes one, and a video when its source lists one and
+// format is Messages or Chat. ZCode attaches a video only to a model whose
+// rule says supportsVideo (its own built-in rules say it per model), and
+// sends it as a Messages video block or a Chat video_url, both of which the
+// gateway carries on (video_input.go); on Responses ZCode refuses a video
+// before asking. A PDF is not offered: a translated request still loses one
+// (#5452). Flandern1211 on X, #5098.
+func zcodeInputs(m catalog.Model, format string) []string {
+	in := []string{"text"}
+	if m.Images {
+		in = append(in, "image")
+	}
+	if (format == "anthropic-messages" || format == "openai-chat-completions") && slices.Contains(m.InputModalities, "video") {
+		in = append(in, "video")
+	}
+	return in
+}
+
+// zcodeOutputsKept keeps a limit.output the user typed into one of
+// magpie's models in config.json at path, in ms, the models magpie writes
+// (outputsKept).
+func zcodeOutputsKept(path string, ms map[string]any) {
+	want := map[string]int{}
+	for id, e := range ms {
+		m, _ := e.(map[string]any)
+		l, _ := m["limit"].(map[string]any)
+		if n := numberOf(l["output"]); n > 0 {
+			want[id] = n
+		}
+	}
+	if len(want) == 0 {
+		return
+	}
+	have := map[string]int{}
+	if raw, ok := edit.GetJSON(path, "provider."+magpieID+".models"); ok {
+		var cur map[string]struct {
+			Limit struct {
+				Output int `json:"output"`
+			} `json:"limit"`
+		}
+		if json.Unmarshal([]byte(raw), &cur) == nil {
+			for id, c := range cur {
+				have[id] = c.Limit.Output
+			}
+		}
+	}
+	kept := outputsKept(path, want, have)
+	for id, e := range ms {
+		m, _ := e.(map[string]any)
+		if l, _ := m["limit"].(map[string]any); l != nil && kept[id] > 0 {
+			l["output"] = kept[id]
+		}
+	}
+}
+
+// zcodeDefaultLevels is the default level each of magpie's models has in
+// config.json at path, which one set by hand keeps (keptEffort). A default
+// a magpie before #3852 wrote as defaultVariant is carried over: ZCode never
+// read that key, only magpie wrote it.
+func zcodeDefaultLevels(path string) map[string]string {
 	var c struct {
 		Provider map[string]struct {
 			Models map[string]struct {
 				Reasoning struct {
+					DefaultLevel   string `json:"defaultLevel"`
 					DefaultVariant string `json:"defaultVariant"`
 				} `json:"reasoning"`
 			} `json:"models"`
@@ -171,7 +244,10 @@ func zcodeVariants(path string) map[string]string {
 	}
 	out := map[string]string{}
 	for id, m := range c.Provider[magpieID].Models {
-		out[id] = m.Reasoning.DefaultVariant
+		out[id] = m.Reasoning.DefaultLevel
+		if out[id] == "" {
+			out[id] = m.Reasoning.DefaultVariant
+		}
 	}
 	return out
 }
@@ -297,6 +373,9 @@ func zcodeRuleFormat(dir string) string {
 // onAnotherMachine says base is an http(s) address whose host isn't this
 // machine's loopback.
 func onAnotherMachine(base string) bool {
+	if loopbackAuthority(base) {
+		return false
+	}
 	u, err := url.Parse(base)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" {
 		return false
@@ -307,6 +386,36 @@ func onAnotherMachine(base string) bool {
 	}
 	ip := net.ParseIP(h)
 	return ip == nil || !ip.IsLoopback() && !ip.IsUnspecified()
+}
+
+// loopbackAuthority is the common case of onAnotherMachine without
+// url.Parse: an http(s) base on localhost, 127.0.0.1 or [::1], no user
+// info, which a state poll asks of each agent's gateway base several
+// hundred times. Anything else is left to url.Parse.
+func loopbackAuthority(base string) bool {
+	rest, ok := strings.CutPrefix(base, "http://")
+	if !ok {
+		if rest, ok = strings.CutPrefix(base, "https://"); !ok {
+			return false
+		}
+	}
+	if i := strings.IndexAny(rest, "/?#"); i >= 0 {
+		rest = rest[:i]
+	}
+	host := rest
+	if i := strings.LastIndexByte(rest, ':'); i >= 0 && !strings.HasSuffix(rest, "]") {
+		host = rest[:i]
+		for _, c := range rest[i+1:] {
+			if c < '0' || c > '9' {
+				return false
+			}
+		}
+	}
+	switch host {
+	case "localhost", "127.0.0.1", "[::1]":
+		return true
+	}
+	return false
 }
 
 // zcodeMaxOutput caps a model's output limit: some vendors report their
@@ -330,6 +439,56 @@ func zcodeLevels(efforts []string) []string {
 	return out
 }
 
+// zcodeOptionsByLevel are the provider options ZCode sends for each of a
+// model's reasoning levels: thinking off for the level named "disabled",
+// on for every other (#3852 — with no provider options for a level ZCode
+// asks the model without thinking, and an always-thinking model refuses).
+// Thinking on carries the level's budget, as Anthropic's Messages API asks
+// of a Claude before 4.6 (budget_tokens is required with "enabled"); the
+// gateway makes it adaptive for a later Claude and fits it under the
+// reply's limit. A level's options already in config.json are the user's
+// and stay: no magpie before #3852 wrote any.
+func zcodeOptionsByLevel(levels []string, own map[string]any) map[string]any {
+	out := map[string]any{}
+	for _, l := range levels {
+		if o, ok := own[l]; ok {
+			out[l] = o
+			continue
+		}
+		th := map[string]any{"type": "disabled"}
+		if l != "disabled" {
+			th = map[string]any{"type": "enabled", "budget_tokens": gateway.ThinkingBudget(l)}
+		}
+		out[l] = map[string]any{"thinking": th}
+	}
+	return out
+}
+
+// zcodeLevelOptions are the providerOptionsByLevel each of magpie's models
+// has in config.json at path, which zcodeOptionsByLevel keeps.
+func zcodeLevelOptions(path string) map[string]map[string]any {
+	var c struct {
+		Provider map[string]struct {
+			Models map[string]struct {
+				Reasoning struct {
+					Options map[string]any `json:"providerOptionsByLevel"`
+				} `json:"reasoning"`
+			} `json:"models"`
+		} `json:"provider"`
+	}
+	b, _ := edit.Read(path)
+	if json.Unmarshal(b, &c) != nil {
+		return nil
+	}
+	out := map[string]map[string]any{}
+	for id, m := range c.Provider[magpieID].Models {
+		if len(m.Reasoning.Options) > 0 {
+			out[id] = m.Reasoning.Options
+		}
+	}
+	return out
+}
+
 // zcodeDefaultLevel is medium where the model has it, else its middle level
 // that thinks.
 func zcodeDefaultLevel(levels []string) string {
@@ -341,6 +500,74 @@ func zcodeDefaultLevel(levels []string) string {
 		return levels[0]
 	}
 	return on[len(on)/2]
+}
+
+// zcodePart is what ZCode reads of magpie's provider when it starts: the
+// provider in config.json and magpie's rules in provider_config.json, not
+// the key (AppBehind).
+func zcodePart(path, rules string) string {
+	var b strings.Builder
+	if raw, ok := edit.GetJSONRaw(path, "provider."+magpieID); ok {
+		var prov map[string]any
+		if json.Unmarshal([]byte(raw), &prov) == nil {
+			if opts, _ := prov["options"].(map[string]any); opts != nil {
+				delete(opts, "apiKey")
+			}
+			if v, err := json.Marshal(prov); err == nil {
+				b.Write(v)
+			}
+		}
+	}
+	b.WriteByte('\n')
+	b.WriteString(zcodeRulesPart(rules))
+	return b.String()
+}
+
+// zcodeRulesPart is magpie's provider rule and model rules in
+// provider_config.json at path, as ZCode reads them at start. A rule of
+// another provider is left out, so ZCode's own writes to one are no change
+// of magpie's.
+func zcodeRulesPart(path string) string {
+	var c struct {
+		Config struct {
+			ProviderConfigRules struct {
+				ProviderRules []json.RawMessage `json:"providerRules"`
+			} `json:"providerConfigRules"`
+			ModelConfigRules struct {
+				ProviderModelRules       []json.RawMessage `json:"providerModelRules"`
+				ManualProviderModelRules []json.RawMessage `json:"manualProviderModelRules"`
+			} `json:"modelConfigRules"`
+		} `json:"config"`
+	}
+	b, _ := os.ReadFile(path)
+	if json.Unmarshal(b, &c) != nil {
+		return ""
+	}
+	var out strings.Builder
+	for _, rs := range [][]json.RawMessage{
+		c.Config.ProviderConfigRules.ProviderRules,
+		c.Config.ModelConfigRules.ProviderModelRules,
+		c.Config.ModelConfigRules.ManualProviderModelRules,
+	} {
+		for _, r := range rs {
+			var m map[string]any
+			if json.Unmarshal(r, &m) != nil || m["providerId"] != magpieID {
+				continue
+			}
+			// the key is not what ZCode's picker reads, and a rotation of
+			// it is no change of the list
+			if cfg, _ := m["config"].(map[string]any); cfg != nil {
+				if access, _ := cfg["access"].(map[string]any); access != nil {
+					delete(access, "apiKey")
+				}
+			}
+			if v, err := json.Marshal(m); err == nil {
+				out.Write(v)
+				out.WriteByte('\n')
+			}
+		}
+	}
+	return out.String()
 }
 
 // zcodeRuled reports whether provider_config.json has magpie's provider.
@@ -414,28 +641,61 @@ func zcodeRules(path string, on, keep bool) error {
 		}
 		manual = append(manual, r)
 	}
+	// magpie's model rules as they are now, which ZCode's own settings
+	// write a model's edits into while it keeps its recommended config
+	ours := map[any]map[string]any{}
 	for _, r := range zcodeList(mcr, "providerModelRules") {
 		if !mine(r) {
 			models = append(models, r)
+			continue
 		}
+		m := r.(map[string]any)
+		ours[m["modelId"]] = m
 	}
 
 	if on {
+		format := zcodeFormat(filepath.Dir(path))
+		searched, known := zcodeSearched()
 		var ids []string
-		for _, m := range magpieModels("zcode") {
+		// a maxOutputTokens typed into a model's rule in ZCode's settings
+		// stays; magpie's is put where the user set none (outputsKept)
+		wantOut, haveOut := map[string]int{}, map[string]int{}
+		for _, m := range sharedModels("zcode") {
+			if n := outputOr(m, zcodeOutput(maxTokens(m))); n > 0 && !byHand[m.ID] {
+				wantOut[m.ID] = n
+			}
+			if r := ours[m.ID]; r != nil {
+				c, _ := r["config"].(map[string]any)
+				s, _ := c["optionSpecs"].(map[string]any)
+				o, _ := s["maxOutputTokens"].(map[string]any)
+				haveOut[m.ID] = numberOf(o["max"])
+			}
+		}
+		keptOut := outputsKept(path, wantOut, haveOut)
+		for _, m := range sharedModels("zcode") {
 			ids = append(ids, m.ID)
 			if byHand[m.ID] {
+				// set by hand in ZCode: its own settings, and the default
+				// again should it go back to its recommended config
+				delete(searched, m.ID)
 				continue
 			}
-			props := map[string]any{"inputFormat": map[string]any{"supportsImage": m.Images}}
+			inputFormat := map[string]any{"supportsImage": m.Images}
+			if slices.Contains(zcodeInputs(m, format), "video") {
+				inputFormat["supportsVideo"] = true
+			}
+			props := map[string]any{"inputFormat": inputFormat}
 			if m.Context > 0 {
 				props["contextWindow"] = m.Context
+			}
+			if v, set := zcodeWebSearch(ours[m.ID], m.ID, format == "anthropic-messages" && known, searched); set {
+				props["supportsNativeWebSearch"] = v
 			}
 			config := map[string]any{"properties": props}
 			// ZCode's own rules give a model it doesn't know 32000 tokens
 			// out and thinking only on or off
 			specs := map[string]any{}
-			if out := outputOr(m, zcodeOutput(maxTokens(m))); out > 0 {
+			if out := keptOut[m.ID]; out > 0 {
 				specs["maxOutputTokens"] = map[string]any{"max": out}
 			}
 			if levels := zcodeLevels(m.Efforts); levels != nil {
@@ -449,6 +709,9 @@ func zcodeRules(path string, on, keep bool) error {
 		if ids == nil {
 			ids = []string{}
 		}
+		if known {
+			zcodeSearchedPut(searched, ids)
+		}
 		base, token := gateway.URL(), hereKey()
 		if keep {
 			base, token = zcodeKept(filepath.Dir(path))
@@ -457,7 +720,7 @@ func zcodeRules(path string, on, keep bool) error {
 			"config": map[string]any{
 				"group":            "standard-personal",
 				"access":           map[string]any{"type": "api-key", "apiKey": token},
-				"api":              map[string]any{"type": zcodeFormat(filepath.Dir(path)), "baseUrl": base},
+				"api":              map[string]any{"type": format, "baseUrl": base},
 				"personalModelIds": ids, "modelOrder": ids,
 			}}
 		// turned off in ZCode, it stays off
@@ -505,6 +768,89 @@ func zcodeRules(path string, on, keep bool) error {
 		}
 	}
 	return edit.WriteAtomic(path, out)
+}
+
+// ZCode offers a model its WebSearch tool only where the model's rule says
+// it has native web search (properties.supportsNativeWebSearch, 原生联网搜索
+// in a model's settings), off by default. Its tool then asks the model
+// again with Anthropic's web_search tool, which only an Anthropic Messages
+// provider is sent: on another API format ZCode fails the search. magpie's
+// gateway runs that tool for any of its models, so it turns native web
+// search on for each model it lists while the format is Anthropic Messages
+// (Gearclickist on Discord: every magpie model had to be ticked by hand).
+//
+// ZCode writes a change to a model with its recommended config into the
+// model's rule, magpie's, and leaves a value equal to ZCode's default out of
+// it: unticking native web search takes the key out. So the models magpie
+// turned it on for are kept in the stash (zcodeSearchedKey), and one of
+// them whose rule has no key now was unticked in ZCode and stays off. A
+// value in the rule is kept as it is.
+const zcodeSearchedKey = "zcode.web_search"
+
+// zcodeWebSearch is what magpie's rule for model id, which says old now,
+// says of native web search: v, or nothing when set is false. anthropic is
+// whether ZCode sends the model's provider-native search (the provider's
+// format is Anthropic Messages, and the stash could be read). searched holds
+// the models magpie turned it on for and is updated.
+func zcodeWebSearch(old map[string]any, id string, anthropic bool, searched map[string]bool) (v, set bool) {
+	props, _ := old["config"].(map[string]any)
+	props, _ = props["properties"].(map[string]any)
+	was, had := props["supportsNativeWebSearch"].(bool)
+	switch {
+	case !anthropic:
+		// magpie's on can't be used there; the user's own value stays
+		if had && was && searched[id] {
+			delete(searched, id)
+			return false, false
+		}
+		return was, had
+	case had:
+		if was {
+			searched[id] = true
+		}
+		return was, true
+	case searched[id]:
+		// unticked in ZCode
+		return false, false
+	}
+	searched[id] = true
+	return true, true
+}
+
+// zcodeSearched is the models magpie turned ZCode's native web search on
+// for, and whether the stash could be read: a stash there that can't be
+// read or parsed is unknown, and nothing is turned on.
+func zcodeSearched() (map[string]bool, bool) {
+	out := map[string]bool{}
+	b, err := os.ReadFile(stashPath())
+	if errors.Is(err, fs.ErrNotExist) {
+		return out, true
+	}
+	var m map[string]string
+	if err != nil || json.Unmarshal(b, &m) != nil {
+		return out, false
+	}
+	if v := m[zcodeSearchedKey]; v != "" {
+		for _, id := range strings.Split(v, "\n") {
+			out[id] = true
+		}
+	}
+	return out, true
+}
+
+// zcodeSearchedPut keeps searched in the stash, only for models magpie
+// still lists (ids), and writes it only when that changes it.
+func zcodeSearchedPut(searched map[string]bool, ids []string) {
+	var keep []string
+	for _, id := range ids {
+		if searched[id] {
+			keep = append(keep, id)
+		}
+	}
+	v := strings.Join(keep, "\n")
+	if stashShared()[zcodeSearchedKey] != v {
+		stash(map[string]string{zcodeSearchedKey: v})
+	}
 }
 
 func zcodeObj(m map[string]any, k string) map[string]any {

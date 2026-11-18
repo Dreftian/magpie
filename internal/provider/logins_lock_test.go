@@ -17,7 +17,7 @@ import (
 // remembered of when the accounts were last looked at.
 func newProcess() {
 	loginsMu.Lock()
-	loginsSeenAt = time.Time{}
+	loginsSeenAt.Store(0)
 	loginsMu.Unlock()
 }
 
@@ -218,5 +218,45 @@ func TestLoginsReadAfreshUnderLock(t *testing.T) {
 	loginsMu.Unlock()
 	if len(ls) != 1 || !bytes.Contains(ls[0].Auth, []byte("r-rotated")) {
 		t.Fatalf("read under the lock: %+v", ls)
+	}
+}
+
+// Writing logins.json only to move when the accounts were last seen
+// builds no catalog anew: an idle magpie did each seenEvery, and dsh's
+// round alone built ~42 MB of models again for it. A change besides the
+// time still has them built anew.
+func TestSeenOnlyWriteBuildsNothingAnew(t *testing.T) {
+	home := signIn(t)
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	noAnthropic(t)
+	claudeSignIn(t, home, time.Now().Add(time.Hour))
+	writeFile(t, filepath.Join(home, ".claude.json"), map[string]any{"oauthAccount": map[string]any{"emailAddress": "own@example.com"}})
+	rememberLogins(true)
+	Logins("") // the side accounts (Copilot) found once, written as new
+
+	raw, mod := seenAgo(t, time.Hour)
+	stamp := StampNow()
+	newProcess()
+	Logins("")
+	if loginsUnchanged(t, raw, mod) {
+		t.Fatal("an account last seen an hour ago wasn't written as seen now")
+	}
+	if StampNow() != stamp {
+		t.Fatalf("a write that moved only Seen had every catalog built anew: %+v %+v", stamp, StampNow())
+	}
+	if b, _ := os.ReadFile(loginsPath()); bytes.Equal(b, raw) {
+		t.Fatal("logins.json kept the old Seen")
+	}
+
+	raw, mod = seenAgo(t, time.Minute)
+	stamp = StampNow()
+	codexSignIn(t, home, "me@example.com", "r-refreshed")
+	newProcess()
+	Logins("")
+	if loginsUnchanged(t, raw, mod) {
+		t.Fatal("Codex's refreshed sign-in wasn't saved")
+	}
+	if StampNow() == stamp {
+		t.Fatal("a refreshed sign-in left the catalogs as they were")
 	}
 }

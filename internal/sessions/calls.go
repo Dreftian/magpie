@@ -15,7 +15,10 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
+	"unsafe"
 
+	"github.com/tidwall/gjson"
 	"github.com/yetone/magpie/internal/desktopdir"
 )
 
@@ -39,8 +42,11 @@ type Call struct {
 	Upstream  string `json:"upstream,omitempty"`
 	AccountID string `json:"account_id,omitempty"`
 	UserID    string `json:"user_id,omitempty"`
-	Error     string `json:"error,omitempty"`      // Claude: the API error's kind (rate_limit, server_error …); such a call has no tokens
-	ErrorText string `json:"error_text,omitempty"` // its message, the first 400 characters
+	// Credits: what the call cost in its plan's own credits, as the file
+	// says (Qoder's, which writes no tokens of its own models)
+	Credits   *float64 `json:"credits,omitempty"`
+	Error     string   `json:"error,omitempty"`      // Claude: the API error's kind (rate_limit, server_error …); such a call has no tokens
+	ErrorText string   `json:"error_text,omitempty"` // its message, the first 400 characters
 	// Codex: the turn's own figures, set only when the turn made just this call
 	TTFT int64 `json:"ttft_ms,omitempty"`
 	// Compaction is Codex's explicit marker that this response compacted the context.
@@ -67,16 +73,21 @@ type Call struct {
 // what it takes to read on from off.
 type callFile struct {
 	Claude      *claudeUsageState
-	ContentHash string
+	ContentHash digest
 	dirty       map[int]bool
-	Size        int64
-	Mod         int64  // unix nanoseconds
-	Off         int64  // after the last whole line read
-	Head        string // hash of the prefix, to tell one replaced from one grown
-	HeadSize    int
-	Path        string
-	Calls       []Call
-	Agent       string
+	// readSize is the size of the file being read (prepareCalls), for
+	// growCalls
+	readSize int64
+	// bigFrame: read from a frame of more than framePatches (loadCalls)
+	bigFrame bool
+	Size     int64
+	Mod      int64  // unix nanoseconds
+	Off      int64  // after the last whole line read
+	Head     digest // of the prefix, to tell one replaced from one grown
+	HeadSize int
+	Path     string
+	Calls    []Call
+	Agent    string
 	// where the line being handled begins and ends, and where the last reply's did
 	At, End, AsstEnd int64
 	Strs             map[string]string
@@ -94,6 +105,12 @@ type callFile struct {
 	CompactMs int64
 	// Codex
 	CX *cxRun
+	// Pi and omp
+	Pi *piCarry
+	// dsh
+	Dsh *dshCarry
+	// Grok Build
+	Grok *grokCallCarry
 }
 
 // cxRun is where a rollout's read stands: what its lines have said so far.
@@ -141,7 +158,17 @@ type cxCallUsage = cxUsage
 var callDesktopDirs = desktopDataDirs
 
 // DesktopDataDirs are the folders whose session metadata belongs to this index.
-func DesktopDataDirs() []string { return callDesktopDirs() }
+func DesktopDataDirs() []string { return desktopReadDirs() }
+
+// desktopReadDirs are callDesktopDirs, or none when Claude Desktop's
+// sessions are not to be read (Reads): its local_*.json and Cowork's
+// folders are its session history.
+func desktopReadDirs() []string {
+	if !Reads("claude-desktop") {
+		return nil
+	}
+	return callDesktopDirs()
+}
 
 // Calls reads per-file request shards, separately from the session summaries.
 // Only changed files are scanned, and only a bounded number of parses stay in
@@ -242,7 +269,7 @@ func callsFor(since time.Time, session, agent string) []Call {
 	capacity := 0
 	callsMu.Lock()
 	for _, f := range files {
-		if since.IsZero() || !f.mod.Before(since) {
+		if since.IsZero() || !f.mod.Before(modOf(since)) {
 			capacity += callCounts[f.path]
 		}
 	}
@@ -252,7 +279,7 @@ func callsFor(since time.Time, session, agent string) []Call {
 	}
 	out := make([]Call, 0, capacity)
 	for _, f := range files {
-		if !since.IsZero() && f.mod.Before(since) {
+		if !since.IsZero() && f.mod.Before(modOf(since)) {
 			continue
 		}
 		st := readCalls(f)
@@ -282,51 +309,60 @@ func callsFor(since time.Time, session, agent string) []Call {
 
 // callFiles are the session files that hold calls: Claude Code's, Cowork's
 // and Desktop's own, and Codex's.
-func callFiles() []file {
-	var out []file
-	seen := map[string]bool{}
-	add := func(fs []file) {
-		for _, f := range fs {
-			if !seen[f.path] {
-				seen[f.path] = true
-				out = append(out, f)
-			}
-		}
-	}
-	add(ccFiles("claude", ClaudeDir()))
-	for _, d := range callDesktopDirs() {
+func callFiles() []file { return callFilesWith(codexFiles()) }
+
+// callFilesWith is callFiles with codex the rollouts codexFiles found.
+func callFilesWith(codex []file) []file { return distinctOf(callFileLists(codex)...) }
+
+// callFileLists are callFilesWith's lists, each path not yet kept once:
+// the callers that list more add theirs and keep each path once, over
+// all of them (distinctOf), instead of copying callFilesWith's again.
+func callFileLists(codex []file) [][]file {
+	lists := [][]file{claudeFiles()}
+	for _, d := range desktopReadDirs() {
 		// Cowork keeps a Claude Code folder of its own for each session
 		homes, _ := SessionGlob(filepath.Join(d, "local-agent-mode-sessions", "*", "*", "local_*", ".claude"))
 		for _, h := range homes {
-			add(ccFiles("claude-desktop", h))
+			lists = append(lists, ccFiles("claude-desktop", h))
 		}
 	}
-	add(codexFiles())
-	add(wslFiles("claude", "codex"))
-	return out
+	return append(lists, allowed(codex), wslFiles("claude", "codex"))
 }
 
-// callSources are callFiles and the agents whose calls are read whole
-// rather than line by line: OpenCode's (#680) and ZCode's, whose calls are
-// rows of their database or their JSON files; DeepSeek Harness's, whose
-// session file is packed in frames and so cannot be read on from the middle
-// of one; and WorkBuddy's, whose usage lines repeat a reply's id as it goes
-// on, as CodeBuddy Code's do (#1779); and MiniMax Code's, whose messages
-// file a later generation of its history may replace (#1605); and Kimi
-// Code's, whose forks copy their parent's records (#1607). Every agent here
-// needs an entry in wholeCallReaders.
-func callSources() []file {
-	out := callFiles()
-	out = append(out, openCodeCallFiles()...)
-	out = append(out, zcodeCallFiles()...)
-	out = append(out, dshCallFiles()...)
-	out = append(out, minimaxCallFiles()...)
-	out = append(out, kimiCallFiles()...)
-	out = append(out, wslFiles("kimi")...)
-	out = append(out, piCallFiles()...)
-	out = append(out, codebuddyCallFiles()...)
-	out = append(out, agyCallFiles()...) // #2097
-	return append(out, workbuddyCallFiles()...)
+// callSources are callFiles and the other agents' session files. Most are
+// read whole rather than line by line: OpenCode's (#680) and ZCode's, whose
+// calls are rows of their database or their JSON files; and WorkBuddy's, whose usage lines repeat a reply's id as it
+// goes on, as CodeBuddy Code's do (#1779); and MiniMax Code's, whose messages
+// file a later generation of its history may replace (#1605); and Droid's, whose spend is
+// only a running total in each session's settings (calls_droid.go). Kimi Code's
+// (#1607), Pi's and omp's (#1951) and Grok Build's (#4423) are lines of a
+// file only appended to, read on as callFiles' are; DeepSeek Harness's, a
+// file only appended to that may be packed in zstd frames, is read on
+// from the frame it was left in (readDshCalls). Every agent here needs an
+// entry in wholeCallReaders, lineCallReaders or resumeCallReaders, but
+// Qoder's and Qoder CN's (qoder.go), whose files are Claude Code's and read
+// as Claude Code's are (ccCallAgent).
+func callSources() []file { return callSourcesWith(codexFiles()) }
+
+// callSourcesWith is callSources with codex the rollouts codexFiles found.
+func callSourcesWith(codex []file) []file { return callSourcesInto(nil, codex) }
+
+// callSourcesInto is callSourcesWith appended to out.
+func callSourcesInto(out []file, codex []file) []file {
+	lists := append(callFileLists(codex), openCodeCallFiles(), zcodeCallFiles(), dshCallFiles(),
+		minimaxCallFiles(), kimiCallFiles(), wslFiles("kimi"), piCallFiles(), codebuddyCallFiles(), workbuddyAIFiles(),
+		agyCallFiles(),                               // #2097
+		antigravityCallFiles(),                       // #2190
+		wslFiles("antigravity"), wslCallFiles("agy"), // @guyng35955 on X
+		devinCallFiles(),                      // aohan0905 on X
+		droidFiles(),                          // _meouwu on X: its settings' totals (calls_droid.go)
+		workbuddyCallFiles(), grokCallFiles(), // #4423
+		// Claude Code's lines, read by claudeCallLine (eating_dream on X)
+		ccFiles("qoder", QoderDir("qoder")), ccFiles("qoder-cn", QoderDir("qoder-cn")))
+	if out == nil {
+		return allowed(distinctOf(lists...))
+	}
+	return allowed(distinctInto(out, lists...))
 }
 
 // desktopDataDirs are Claude Desktop's folders on this computer that
@@ -351,7 +387,9 @@ func headOf(path string) string {
 }
 
 // prepareCalls clones the continuation so a published index is never changed.
-func prepareCalls(f file, old *callFile) *callFile {
+// owned: old was read from disk for this read alone (loadKept), so its
+// calls are taken as they are rather than copied for st.
+func prepareCalls(f file, old *callFile, owned bool) *callFile {
 	// The disk shard stores final calls, not a second copy of every usage
 	// observation. Rebuild continuation only when a cold source grows.
 	if f.agent == "codex" && old != nil && (old.CX == nil || old.CX.Usage == nil) {
@@ -359,14 +397,18 @@ func prepareCalls(f file, old *callFile) *callFile {
 	}
 	// Disk shards keep final calls, not message block/tool maps. A changed
 	// Claude source reconstructs its transient revision index after restart.
-	if (f.agent == "claude" || f.agent == "claude-desktop") && old != nil && old.Claude == nil {
+	if ccCallAgent(f.agent) && old != nil && old.Claude == nil {
 		old = nil
 	}
 
 	head := headOf(f.path)
 	var st *callFile
-	if old != nil && !packed(f.path) && f.size >= old.Size && old.Off <= f.size && sameHead(head, old.Head, old.HeadSize) && old.ContentHash != "" && prefixHash(f.path, old.Size) == old.ContentHash {
-		st = old.clone()
+	if old != nil && !packed(f.path) && f.size >= old.Size && old.Off <= f.size && sameHead(head, old.Head, old.HeadSize) && old.ContentHash != (digest{}) && prefixHash(f.path, old.Off) == old.ContentHash {
+		if owned {
+			st = old.cloneState()
+		} else {
+			st = old.clone()
+		}
 	} else {
 		st = &callFile{Agent: f.agent}
 		if f.agent == "codex" {
@@ -380,15 +422,45 @@ func prepareCalls(f file, old *callFile) *callFile {
 		}
 	}
 	st.dirty = map[int]bool{}
-	st.Head, st.HeadSize, st.Path = hashHead(head), len(head), f.path
+	st.Head, st.HeadSize, st.Path = headDigest(head), len(head), f.path
+	st.readSize = f.size
 	return st
 }
 
+// growCalls makes room in st.Calls, when it is full, for the calls the
+// rest of the file holds at the rate read so far: append grows a long
+// list by a quarter at a time, and a Claude session's calls were copied
+// into ~5 lists their size on the way (616 MB of a cold start's reading
+// on mote, ~13% of all it allocated). The room is at most twice the
+// calls so far, as append's own doubling of a short list.
+func growCalls(st *callFile) {
+	n := len(st.Calls)
+	if n < cap(st.Calls) || n < 256 || st.End <= 0 || st.readSize <= st.End {
+		return
+	}
+	// what the rest is likely to hold, and an eighth more
+	want := min(int(int64(n)*st.readSize/st.End)*9/8, 2*n)
+	if want > n+n/4+1 {
+		st.Calls = slices.Grow(st.Calls, want-n)
+	}
+}
+
 func (st *callFile) clone() *callFile {
-	c := *st
+	c := st.cloneState()
 	c.Calls = append([]Call(nil), st.Calls...)
-	c.Claude = st.Claude.clone()
 	c.Msgs, c.Began, c.Strs = maps.Clone(st.Msgs), maps.Clone(st.Began), maps.Clone(st.Strs)
+	return c
+}
+
+// cloneState is a copy of st's reading state that shares its calls, and
+// their Msgs, Began and Strs. The state may be a kept continuation's
+// (restoreCallContinuation), so it is copied; the calls of a file just
+// read from disk have no other reader, and copying them on every change
+// of a live session was 160 MB of eight Requests polls (of 3.9 GB) on
+// real history.
+func (st *callFile) cloneState() *callFile {
+	c := *st
+	c.Claude = st.Claude.clone()
 	if st.CX != nil {
 		r := *st.CX
 		r.Turns = maps.Clone(r.Turns)
@@ -396,6 +468,22 @@ func (st *callFile) clone() *callFile {
 		r.Contexts = maps.Clone(r.Contexts)
 		r.Timings = append([]cxCallTiming(nil), r.Timings...)
 		c.CX = &r
+	}
+	if st.Pi != nil {
+		p := *st.Pi
+		c.Pi = &p
+	}
+	if st.Dsh != nil {
+		d := *st.Dsh
+		if d.Tail != nil {
+			t := *d.Tail
+			d.Tail = &t
+		}
+		c.Dsh = &d
+	}
+	if st.Grok != nil {
+		g := *st.Grok
+		c.Grok = &g
 	}
 	return &c
 }
@@ -408,7 +496,9 @@ func cxAnswerItem(b []byte) bool {
 		return false
 	}
 	switch typeAfter(h, cxPayload) {
-	case "reasoning", "function_call", "custom_tool_call", "web_search_call", "local_shell_call", "tool_search_call", "image_generation_call":
+	// magpie_reasoning: a reasoning item of magpie's, written so as Codex let
+	// magpie go (PortCodexRolloutsLeft)
+	case "reasoning", "magpie_reasoning", "function_call", "custom_tool_call", "web_search_call", "local_shell_call", "tool_search_call", "image_generation_call":
 		return true
 	case "message":
 		return typeAfter(h, cxRole) == "assistant"
@@ -427,11 +517,89 @@ func callHead(st *callFile, b []byte) bool {
 		return false
 	}
 	compacted := typeAfter(b[:min(len(b), 1024)], cxType) == "compacted"
-	if !compacted && (bytes.Contains(b, cxUserMsg) || bytes.Contains(b, cxUserRole) || bytes.Contains(b, cxToolOut) || bytes.Contains(b, cxCustomOut)) {
+	m := cxMarksOf(b)
+	if !compacted && m&cxInput != 0 {
 		codexCallLine(st, b)
 		return false
 	}
-	return bytes.Contains(b, cxMeta) || bytes.Contains(b, cxTurn) || bytes.Contains(b, cxRecord) || bytes.Contains(b, cxCompacted) || bytes.Contains(b, cxCount) || bytes.Contains(b, cxSettings) || bytes.Contains(b, cxStarted) || bytes.Contains(b, cxDone)
+	return m&cxFollowed != 0
+}
+
+// cxMarks are the "type" values a rollout line holds anywhere in it that
+// codexCallLine follows, and whether an object in it has the user's role.
+type cxMarks uint16
+
+const (
+	cxMarkUserMsg cxMarks = 1 << iota
+	cxMarkUserRole
+	cxMarkToolOut
+	cxMarkMeta
+	cxMarkTurn
+	cxMarkRecord
+	cxMarkCompacted
+	cxMarkCount
+	cxMarkSettings
+	cxMarkStarted
+	cxMarkDone
+
+	// what the model is given: the prompt, a tool's output
+	cxInput = cxMarkUserMsg | cxMarkUserRole | cxMarkToolOut
+	// the lines codexCallLine reads whole
+	cxFollowed = cxMarkMeta | cxMarkTurn | cxMarkRecord | cxMarkCompacted | cxMarkCount | cxMarkSettings | cxMarkStarted | cxMarkDone
+)
+
+var (
+	cxKeyEnd   = []byte(`":"`)
+	cxTypeKey  = []byte(`"type`)
+	cxRoleKey  = []byte(`"role`)
+	cxUserName = []byte(`user"`)
+)
+
+// cxMarksOf reads b's marks in one pass: every `"type":"<v>"` and
+// `"role":"user"` that a bytes.Contains of each would find, as one each
+// had been (up to twelve passes over a line of megabytes, most of a cold
+// usage read's CPU on Windows, #3493). In a JSON string the quotes are
+// escaped, so the `":"` ending a key is never inside one.
+func cxMarksOf(b []byte) (m cxMarks) {
+	for {
+		i := bytes.Index(b, cxKeyEnd)
+		if i < 0 {
+			return m
+		}
+		key, val := b[:i], b[i+len(cxKeyEnd):]
+		b = val
+		switch {
+		case bytes.HasSuffix(key, cxTypeKey):
+			j := bytes.IndexByte(val, '"')
+			if j < 0 {
+				return m
+			}
+			switch string(val[:j]) {
+			case "user_message":
+				m |= cxMarkUserMsg
+			case "function_call_output", "custom_tool_call_output":
+				m |= cxMarkToolOut
+			case "session_meta":
+				m |= cxMarkMeta
+			case "turn_context":
+				m |= cxMarkTurn
+			case "token_usage_record":
+				m |= cxMarkRecord
+			case "compacted":
+				m |= cxMarkCompacted
+			case "token_count":
+				m |= cxMarkCount
+			case "thread_settings_applied":
+				m |= cxMarkSettings
+			case "task_started":
+				m |= cxMarkStarted
+			case "task_complete":
+				m |= cxMarkDone
+			}
+		case bytes.HasSuffix(key, cxRoleKey) && bytes.HasPrefix(val, cxUserName):
+			m |= cxMarkUserRole
+		}
+	}
 }
 
 // sessionOfPath is the session a Claude Code file belongs to by its name:
@@ -497,6 +665,15 @@ func (st *callFile) str(s string) string {
 type ccStr string
 
 func (s *ccStr) UnmarshalJSON(b []byte) error {
+	// a string with nothing escaped is its bytes: json.Unmarshal made a
+	// decoder of its own for each, six to a reply line (29 MB on a first
+	// start's 21 GB history, #2278). The line was checked whole before
+	// this is called, and bytes that aren't UTF-8 are left to it, which
+	// writes U+FFFD for them.
+	if n := len(b); n >= 2 && b[0] == '"' && b[n-1] == '"' && bytes.IndexByte(b[1:n-1], '\\') < 0 && utf8.Valid(b[1:n-1]) {
+		*s = ccStr(b[1 : n-1])
+		return nil
+	}
 	var v string
 	if json.Unmarshal(b, &v) == nil {
 		*s = ccStr(v)
@@ -528,50 +705,194 @@ type ccCall struct {
 			CacheRead  int              `json:"cache_read_input_tokens"`
 			CacheWrite int              `json:"cache_creation_input_tokens"`
 			Creation   *ccCacheCreation `json:"cache_creation"`
+			Credits    ccNum            `json:"credits"`
 		} `json:"usage"`
 	} `json:"message"`
+}
+
+// ccNum is a number field that reads as unset when a file holds something
+// else there, so a line is never lost for it.
+type ccNum struct {
+	V   float64
+	Set bool
+}
+
+func (n *ccNum) UnmarshalJSON(b []byte) error {
+	var v float64
+	if json.Unmarshal(b, &v) == nil && !bytes.Equal(b, []byte("null")) {
+		*n = ccNum{v, true}
+	}
+	return nil
+}
+
+// ccCallAgent says whether agent's session files are Claude Code's, its
+// calls read by claudeCallLine: Claude Code's and Desktop's own, and
+// Qoder's (qoder.go), whose lines are Claude Code's.
+func ccCallAgent(agent string) bool {
+	switch agent {
+	case "claude", "claude-desktop", "qoder", "qoder-cn":
+		return true
+	}
+	return false
 }
 
 // claudeCallLine notes the call an assistant line is (a block of) in the
 // file: the latest of a message's lines stands for it, as it has the final
 // usage. A synthetic line is a call only as an API error.
 func claudeCallLine(st *callFile, b []byte) {
-	if !bytes.Contains(b, ccAssistant) {
-		switch {
-		case bytes.Contains(b, ccIdentity):
-			// a note of the model it runs as, on the first turn and when it is changed
-			var n struct {
-				Attachment struct {
-					Identity struct {
-						ModelID string `json:"modelId"`
-					} `json:"identity"`
-				} `json:"attachment"`
-			}
-			if json.Unmarshal(b, &n) == nil && n.Attachment.Identity.ModelID != "" {
-				st.Requested = st.str(n.Attachment.Identity.ModelID)
-			}
-		case bytes.Contains(b, ccCompact):
-			// {"type":"system","subtype":"compact_boundary","compactMetadata":{"durationMs":48913,…}}
-			var n struct {
-				Meta struct {
-					DurationMs int64 `json:"durationMs"`
-				} `json:"compactMetadata"`
-			}
-			if json.Unmarshal(b, &n) == nil && n.Meta.DurationMs > 0 {
-				st.CompactMs = n.Meta.DurationMs
-			}
-		case bytes.Contains(b, ccUserLine):
-			// what a reply is asked by: a prompt, or a tool's result
-			if at := tsAt(b, true); !at.IsZero() {
-				st.LastUser = at
-			}
+	top, reply := ccLineType(b), false
+	switch {
+	case bytes.Equal(top, ccUserWord):
+		ccUserCallLine(st, b)
+		return
+	case top != nil && !bytes.Equal(top, ccAssistantWord):
+		ccOtherCallLine(st, b)
+		return
+	case top == nil:
+		if reply = ccReplyHead(b); !reply && !bytes.Contains(b, ccAssistant) {
+			ccOtherCallLine(st, b)
+			return
+		}
+	}
+	var l ccCall
+	if ccDecode(b, &l) != nil || l.Type != "assistant" {
+		if reply && !bytes.Contains(b, ccAssistant) {
+			ccOtherCallLine(st, b)
 		}
 		return
 	}
-	var l ccCall
-	if json.Unmarshal(b, &l) != nil || l.Type != "assistant" {
-		return
+	claudeCall(st, b, &l)
+}
+
+var (
+	ccType          = []byte(`"type":"`)
+	ccUserWord      = []byte("user")
+	ccAssistantWord = []byte("assistant")
+)
+
+// ccLineType is the type a Claude Code line's head names before any
+// object or list opens in it, nil when it names none there. Claude Code
+// writes a prompt's, a tool result's and an attachment's type before
+// their message, a reply's after it: each line was searched for the
+// type of a reply, an identity, a compaction and a prompt, four reads
+// of a tool's whole result and ~7 s of a first start's CPU on a 14 GB
+// history (#2278).
+func ccLineType(b []byte) []byte {
+	h := b[:min(len(b), 1024)]
+	if len(h) == 0 || h[0] != '{' {
+		return nil
 	}
+	i := bytes.Index(h, ccType)
+	if i < 0 || bytes.ContainsAny(h[1:i], "{[") {
+		return nil
+	}
+	rest := h[i+len(ccType):]
+	j := bytes.IndexByte(rest, '"')
+	if j < 0 {
+		return nil
+	}
+	return rest[:j]
+}
+
+// ccReplyHead says whether b opens as Claude Code writes a reply: its
+// message first, with its model, then its role (claudeLine).
+func ccReplyHead(b []byte) bool {
+	h := b[:min(len(b), 1024)]
+	m, a := bytes.Index(h, ccMessage), bytes.Index(h, ccAttach)
+	if m < 0 || a >= 0 && a < m {
+		return false
+	}
+	msg := h[m+len(ccMessage):]
+	if !bytes.HasPrefix(msg, ccModel) {
+		return false
+	}
+	i := bytes.Index(msg, ccRole)
+	return i >= 0 && bytes.HasPrefix(msg[i+len(ccRole):], []byte(`assistant"`))
+}
+
+// ccDecode is json.Unmarshal of b into l with its message's content
+// null, when it has one: a reply's usage, ids and model are decoded
+// without its text, thinking and tools' input, which encoding/json read
+// twice over (checked, then decoded) for fields it doesn't keep. The line
+// without its content is made in a buffer kept for the next line, and the
+// content is found without gjson.GetBytes's copy of it: a first start's
+// read of a 21 GB history made 82 MB of those lines and 27 MB of copies
+// of their content, which nothing kept (#2278).
+func ccDecode(b []byte, l *ccCall) error {
+	_, err := ccDecodeLess(b, l)
+	return err
+}
+
+// ccDecodeLess is ccDecode into any v: json.Unmarshal(b, v) with the
+// message's content null, the content given as the bytes of b that hold
+// it (nil when b has none, and v was decoded from b whole). v keeps no
+// byte of the line decoded: its strings are copies.
+func ccDecodeLess(b []byte, v any) ([]byte, error) {
+	if len(b) == 0 {
+		return nil, json.Unmarshal(b, v)
+	}
+	c := gjson.Get(unsafe.String(&b[0], len(b)), "message.content")
+	if !c.Exists() || c.Index <= 0 || c.Index+len(c.Raw) > len(b) {
+		return nil, json.Unmarshal(b, v)
+	}
+	p := ccLines.Get().(*[]byte)
+	out := append((*p)[:0], b[:c.Index]...)
+	out = append(out, "null"...)
+	out = append(out, b[c.Index+len(c.Raw):]...)
+	err := json.Unmarshal(out, v)
+	if cap(out) <= ccLineKept {
+		*p = out
+		ccLines.Put(p)
+	}
+	return b[c.Index : c.Index+len(c.Raw) : c.Index+len(c.Raw)], err
+}
+
+// ccLines holds the buffers ccDecode makes its lines in; one grown past
+// ccLineKept, for a reply line with a long head, is left to the GC.
+var ccLines = sync.Pool{New: func() any { return new([]byte) }}
+
+const ccLineKept = 64 << 10
+
+// ccOtherCallLine reads a line of Claude Code's that is not a reply.
+func ccOtherCallLine(st *callFile, b []byte) {
+	switch {
+	case bytes.Contains(b, ccIdentity):
+		// a note of the model it runs as, on the first turn and when it is changed
+		var n struct {
+			Attachment struct {
+				Identity struct {
+					ModelID string `json:"modelId"`
+				} `json:"identity"`
+			} `json:"attachment"`
+		}
+		if json.Unmarshal(b, &n) == nil && n.Attachment.Identity.ModelID != "" {
+			st.Requested = st.str(n.Attachment.Identity.ModelID)
+		}
+	case bytes.Contains(b, ccCompact):
+		// {"type":"system","subtype":"compact_boundary","compactMetadata":{"durationMs":48913,…}}
+		var n struct {
+			Meta struct {
+				DurationMs int64 `json:"durationMs"`
+			} `json:"compactMetadata"`
+		}
+		if json.Unmarshal(b, &n) == nil && n.Meta.DurationMs > 0 {
+			st.CompactMs = n.Meta.DurationMs
+		}
+	case bytes.Contains(b, ccUserLine):
+		ccUserCallLine(st, b)
+	}
+}
+
+// ccUserCallLine notes what a reply is asked by: a prompt, or a tool's
+// result.
+func ccUserCallLine(st *callFile, b []byte) {
+	if at := tsAt(b, true); !at.IsZero() {
+		st.LastUser = at
+	}
+}
+
+// claudeCall is claudeCallLine of a reply's line b, l.
+func claudeCall(st *callFile, b []byte, l *ccCall) {
 	at, _ := time.Parse(time.RFC3339Nano, l.Time)
 	model := l.Message.Model
 	if at.IsZero() || model == "<synthetic>" && !l.APIError {
@@ -637,7 +958,7 @@ func claudeCallLine(st *callFile, b []byte) {
 	if c.Session == "" {
 		c.Session = st.Session
 	}
-	if st.Agent == "claude" && l.Entrypoint == "claude-desktop" {
+	if st.Agent == "claude" && desktopEntrypoint(string(l.Entrypoint)) {
 		c.Agent = "claude-desktop"
 	}
 	if l.APIError {
@@ -659,7 +980,15 @@ func claudeCallLine(st *callFile, b []byte) {
 		}
 		c.Model = st.str(model)
 		c.Tokens = ccTokens(u.Input, u.Output, u.CacheRead, u.CacheWrite, u.Creation)
-		if c.Tokens.zero() && m.Usage == nil {
+		if u.Credits.Set && (st.Agent == "qoder" || st.Agent == "qoder-cn") {
+			// Qoder writes its own models' replies with every count 0
+			// unless QODER_EXPOSE_TOKEN_USAGE is set (qodercli 1.1.0 on,
+			// the app's worker too), and the credits the reply cost: a
+			// call of no tokens known, counted by what it cost
+			v := u.Credits.V
+			c.Credits = &v
+		}
+		if c.Tokens.zero() && m.Usage == nil && c.Credits == nil {
 			return
 		}
 		if !asked.IsZero() && at.After(asked) {
@@ -672,6 +1001,10 @@ func claudeCallLine(st *callFile, b []byte) {
 			previous := &st.Calls[i]
 			changed := previous.RequestID != m.Request
 			previous.RequestID = m.Request
+			// Qoder's counts stay 0 while what the reply cost is told
+			if c.Credits != nil && (previous.Credits == nil || *previous.Credits != *c.Credits) {
+				previous.Credits, changed = c.Credits, true
+			}
 			// A new block can finish a reply with unchanged usage. Retain
 			// its duration/content boundary without moving usage across days.
 			if newBlock && m.Usage.Model == c.Model && m.Usage.Tokens == c.Tokens &&
@@ -706,6 +1039,7 @@ func claudeCallLine(st *callFile, b []byte) {
 	if c.Error == "" {
 		c.Compact, st.CompactMs = st.CompactMs, 0
 	}
+	growCalls(st)
 	st.Calls = append(st.Calls, c)
 }
 
@@ -718,13 +1052,10 @@ func firstChars(s string, n int) string {
 }
 
 var (
-	ccIdentity  = []byte(`"identity":{"modelId":"`)
-	ccUserLine  = []byte(`"type":"user"`)
-	ccCompact   = []byte(`"subtype":"compact_boundary"`)
-	cxToolOut   = []byte(`"type":"function_call_output"`)
-	cxCustomOut = []byte(`"type":"custom_tool_call_output"`)
-	cxStarted   = []byte(`"type":"task_started"`)
-	cxDone      = []byte(`"type":"task_complete"`)
+	ccIdentity = []byte(`"identity":{"modelId":"`)
+	ccUserLine = []byte(`"type":"user"`)
+	ccCompact  = []byte(`"subtype":"compact_boundary"`)
+	cxStarted  = []byte(`"type":"task_started"`)
 )
 
 // cxCall is a line of a Codex rollout that says something about calls.
@@ -737,6 +1068,7 @@ type cxCall struct {
 		ID          string   `json:"id"`
 		SessionID   string   `json:"session_id"`
 		ThreadID    string   `json:"thread_id"`
+		ForkedFrom  string   `json:"forked_from_id"`
 		Upstream    string   `json:"model_provider"`
 		AccountID   string   `json:"creator_account_id"`
 		UserID      string   `json:"creator_user_id"`
@@ -782,18 +1114,21 @@ func codexCallLine(st *callFile, b []byte) {
 		st.codexChanged(r.Usage.compacted(tsAt(b, false), r.Model, cxCompactionIn(b)))
 		return
 	}
-	if bytes.Contains(b, cxUserMsg) || bytes.Contains(b, cxUserRole) || bytes.Contains(b, cxToolOut) || bytes.Contains(b, cxCustomOut) {
+	m := cxMarksOf(b)
+	if m&cxInput != 0 {
 		if at := tsAt(b, false); !at.IsZero() {
 			r.LastIn = at
-			if bytes.Contains(b, cxUserMsg) || bytes.Contains(b, cxUserRole) {
+			if m&(cxMarkUserMsg|cxMarkUserRole) != 0 {
 				r.Usage.Pending = 0
 			}
 			r.saveContext()
 		}
 		return
 	}
-	if !(!r.Meta && bytes.Contains(b, cxMeta) || bytes.Contains(b, cxTurn) || bytes.Contains(b, cxRecord) || bytes.Contains(b, cxCompacted) || bytes.Contains(b, cxCount) ||
-		bytes.Contains(b, cxSettings) || bytes.Contains(b, cxStarted) || bytes.Contains(b, cxDone)) {
+	if r.Meta {
+		m &^= cxMarkMeta
+	}
+	if m&cxFollowed == 0 {
 		return
 	}
 	var l cxCall
@@ -819,6 +1154,7 @@ func codexCallLine(st *callFile, b []byte) {
 		r.Upstream, r.AccountID, r.UserID = st.str(p.Upstream), st.str(p.AccountID), st.str(p.UserID)
 		r.Usage.context(r.Session, "", "")
 		r.Usage.beginSnapshot(tsAt(b, false), p.ID, p.cxHistorySnapshot)
+		r.Usage.forkedFrom(st.Path, p.ForkedFrom)
 	case l.Type == "turn_context":
 		if p.Upstream != "" {
 			r.Upstream = st.str(p.Upstream)
@@ -1006,36 +1342,45 @@ func (st *callFile) codexCompact(i int) {
 }
 
 func hashHead(head string) string { return fmt.Sprintf("%x", sha256.Sum256([]byte(head))) }
-func sameHead(head, hash string, size int) bool {
-	return size >= 0 && len(head) >= size && hashHead(head[:size]) == hash
+func sameHead(head string, hash digest, size int) bool {
+	return size >= 0 && len(head) >= size && headDigest(head[:size]) == hash
 }
 
 // prefixHash checks distributed windows of the indexed prefix. Small files
-// are checked in full. The version tag invalidates earlier full-file hashes.
+// are checked in full.
 // Rewrites outside the sampled windows can go undetected; appends cost at most
 // 64 KiB of reads per fingerprint regardless of the session's length.
-func prefixHash(path string, n int64) string {
+func prefixHash(path string, n int64) digest {
 	f, err := os.Open(path)
 	if err != nil {
-		return ""
+		return digest{}
 	}
 	defer f.Close()
 	h := sha256.New()
 	const window, samples = int64(4096), int64(16)
+	// io.CopyN made a 32 KB buffer each call, and each of the 16 samples
+	// of a long file: 0.8 GB of a cold start's first 2 minutes.
+	buf := hashBufs.Get().(*[window * samples]byte)
+	defer hashBufs.Put(buf)
 	if n <= window*samples {
-		if _, err = io.CopyN(h, f, n); err != nil {
-			return ""
+		if _, err = io.ReadFull(f, buf[:n]); err != nil {
+			return digest{}
 		}
+		h.Write(buf[:n])
 	} else {
 		for i := int64(0); i < samples; i++ {
 			off := (n - window) * i / (samples - 1)
-			if _, err = io.CopyN(h, io.NewSectionReader(f, off, window), window); err != nil {
-				return ""
+			// A full window may come back with io.EOF at the file's end.
+			if k, _ := f.ReadAt(buf[:window], off); int64(k) < window {
+				return digest{}
 			}
+			h.Write(buf[:window])
 		}
 	}
-	return fmt.Sprintf("sample-v1:%x", h.Sum(nil))
+	return digest(h.Sum(nil)[:16])
 }
+
+var hashBufs = sync.Pool{New: func() any { return new([64 << 10]byte) }}
 
 // CallSource identifies a raw local request log without reading its contents.
 type CallSource struct {
@@ -1044,12 +1389,44 @@ type CallSource struct {
 	Modified         time.Time
 }
 
-func CallSources() []CallSource {
-	fs := callSources()
+func CallSources() []CallSource { return callSourcesOf(callSources()) }
+
+// CallSourcesAndCodexIdentities is CallSources and CodexIdentities from one
+// walk of the Codex folders. The Requests page asks for both on every
+// rebuild, and the walk lstat()s each rollout: twice over 12k rollouts was
+// ~150ms of each rebuild.
+func CallSourcesAndCodexIdentities() ([]CallSource, map[string]CodexIdentity) {
+	codex := codexFiles()
+	// the listing is let go once its sources are taken: made new on each
+	// Requests and effort ask, it was ~100 MB of a minute of polls (#2278)
+	fs := callSourcesInto(listingBuf(), codex)
+	sources := callSourcesOf(fs)
+	putListingBuf(fs)
+	return sources, codexIdentitiesOf(codex)
+}
+
+// listingBufs are listings a read takes and lets go of before it ends,
+// kept on a shelf: a sync.Pool, emptied by the collections a poll makes
+// about twice a second, had none for most reads (#2278).
+var listingBufs shelf[[]file]
+
+func listingBuf() []file {
+	if b, ok := listingBufs.take(nil); ok {
+		return b[:0]
+	}
+	return nil
+}
+
+func putListingBuf(fs []file) {
+	clear(fs[:cap(fs)]) // its files' strings go with the listing
+	listingBufs.give(fs[:0], func(h, fs []file) bool { return cap(h) < cap(fs) })
+}
+
+func callSourcesOf(fs []file) []CallSource {
 	pruneCalls(fs)
 	out := make([]CallSource, 0, len(fs))
 	for _, f := range fs {
-		out = append(out, CallSource{f.path, f.key, f.agent, f.size, f.mod})
+		out = append(out, CallSource{f.path, f.key, f.agent, f.size, f.mod.Time()})
 	}
 	return out
 }
@@ -1057,7 +1434,10 @@ func CallSources() []CallSource {
 // ReadCallSource returns immutable calls for one source. Independent files can
 // be read concurrently; disk IO never holds callsMu.
 func ReadCallSource(s CallSource) []Call {
-	st := readCalls(file{path: s.Path, key: s.Key, agent: s.Agent, size: s.Size, mod: s.Modified})
+	if !Reads(s.Agent) {
+		return nil
+	}
+	st := readCalls(file{path: s.Path, key: s.Key, agent: s.Agent, size: s.Size, mod: modOf(s.Modified)})
 	// Requests retains its own compact snapshot. Keeping the expanded parser's
 	// calls as well doubles residency, especially for long active sessions. The
 	// append-frame shard still carries the continuation for the next read.
@@ -1077,4 +1457,12 @@ func ReadCallSource(s CallSource) []Call {
 	}
 	callsMu.Unlock()
 	return st.Calls
+}
+
+// desktopEntrypoint is a Claude Code transcript's entrypoint when Claude
+// Desktop ran it for its Code tab: "claude-desktop", or
+// "claude-desktop-3p" in its third-party inference mode (Desktop 2.7032's
+// nK: type "3p"), the mode a gateway such as magpie's is set in.
+func desktopEntrypoint(e string) bool {
+	return e == "claude-desktop" || e == "claude-desktop-3p"
 }

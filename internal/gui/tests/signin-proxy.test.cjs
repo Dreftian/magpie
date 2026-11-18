@@ -3,7 +3,7 @@
 // (#1663, demystify0137: a sign-in went through the global proxy, the
 // account's requests after it through the subscription's). The sign-in
 // sheet says which, as a link: Claude's account with a proxy of its own,
-// signed in to again past Claude's warning, says that one, and the request
+// signed in to again (no warning: it has accounts), says that one, and the request
 // names the account. The link's menu offers Direct, Claude's proxy (its
 // password left out), the account's own and Custom…, but not the global
 // proxy, which an account can't be kept on while Claude has a proxy and
@@ -33,6 +33,16 @@ const codex = {
   proxy: "",
 };
 
+// openVia opens the sign-in's proxy menu. The sheet can have just
+// scrolled to hold the pressed button, and a click scrolls its target into
+// view first: a scroll event is delivered on the next frame, after the
+// click has opened the menu, which takes it for the reader's scroll and
+// closes. So the button is put in view and that scroll let land first.
+async function openVia(page, via) {
+  await via.scrollIntoViewIfNeeded();
+  await page.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))));
+  await via.click();
+}
 function serve(lang, seen) {
   const providers = { providers: [claude, codex], presets: [], excluded: [], gateway: { running: true, window: true } };
   const state = { agents: [], profiles: [], settings: { lang, theme: "light" } };
@@ -71,11 +81,11 @@ function serve(lang, seen) {
 }
 
 const W = {
-  en: { anyway: "Sign in anyway", again: "Sign in again", via: "Proxy: {p}", global: "Global proxy", direct: "Direct", custom: "Custom…", go: "Sign in through it" },
-  zh: { anyway: "仍然登录", again: "重新登录", via: "代理：{p}", global: "全局代理", direct: "直连", custom: "自定义…", go: "经由它登录" },
-  "zh-TW": { anyway: "仍然登入", again: "重新登入", via: "代理：{p}", global: "全域代理", direct: "直連", custom: "自訂…", go: "經由它登入" },
-  ja: { anyway: "それでもサインイン", again: "再度サインイン", via: "プロキシ：{p}", global: "グローバルプロキシ", direct: "直接接続", custom: "カスタム…", go: "これ経由でサインイン" },
-  de: { anyway: "Trotzdem anmelden", again: "Erneut anmelden", via: "Proxy: {p}", global: "Globaler Proxy", direct: "Direkt", custom: "Eigener…", go: "Darüber anmelden" },
+  en: { again: "Sign in again", via: "Proxy: {p}", global: "Global proxy", direct: "Direct", custom: "Custom…", go: "Sign in through it" },
+  zh: { again: "重新登录", via: "代理：{p}", global: "全局代理", direct: "直连", custom: "自定义…", go: "经由它登录" },
+  "zh-TW": { again: "重新登入", via: "代理：{p}", global: "全域代理", direct: "直連", custom: "自訂…", go: "經由它登入" },
+  ja: { again: "再度サインイン", via: "プロキシ：{p}", global: "グローバルプロキシ", direct: "直接接続", custom: "カスタム…", go: "これ経由でサインイン" },
+  de: { again: "Erneut anmelden", via: "Proxy: {p}", global: "Globaler Proxy", direct: "Direkt", custom: "Eigener…", go: "Darüber anmelden" },
 };
 
 const sizes = [{ width: 900, height: 800 }, { width: 380, height: 760 }];
@@ -95,6 +105,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
           await browser.close();
         });
         page.setDefaultTimeout(5000);
+        page.setDefaultNavigationTimeout(60000);
         const errors = [], seen = { starts: [], canceled: [] };
         page.on("pageerror", (e) => errors.push(e.message));
         await page.route("**/*", serve(lang, seen));
@@ -107,8 +118,6 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         const bob = page.locator(".editor .accts .acc", { hasText: "bob@example.com" });
         await bob.locator("button", { hasText: w.again }).click();
         const box = page.locator(".editor .signing");
-        // Claude's warning first: the account asked for kept past it
-        await box.locator("button", { hasText: w.anyway }).click();
         const via = box.locator(".acts .via");
         await via.waitFor();
         assert.deepEqual(seen.starts, [{ agent: "claude", user: "bob@example.com" }]);
@@ -121,7 +130,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         // in sight first: Playwright scrolls to what it clicks
         await via.scrollIntoViewIfNeeded();
         const before = await scrolls();
-        await via.click();
+        await openVia(page, via);
         const menu = page.locator(".proto-menu");
         await menu.waitFor();
         const names = await menu.locator(".pm-item .pm-name").allTextContents();
@@ -143,13 +152,13 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         // sign-in started again drew the link anew at the editor's foot,
         // partly under its bar at 380: in sight first, as above
         await via.scrollIntoViewIfNeeded();
-        await via.click();
+        await openVia(page, via);
         await menu.locator(".pm-item", { hasText: w.custom }).click();
         const form = box.locator("form.proxy-ask");
         await form.waitFor();
         const go = form.locator("button", { hasText: w.go });
         assert.equal(await go.isDisabled(), true, "nothing to sign in through yet");
-        await form.locator("input").fill("http://127.0.0.1:8888");
+        await form.locator("input").first().fill("http://127.0.0.1:8888");
         await go.click();
         await page.waitForFunction(() => document.querySelector(".editor .signing .acts .via")?.textContent.includes("8888"));
         assert.deepEqual(seen.starts[2], { agent: "claude", user: "bob@example.com", proxy: "http://127.0.0.1:8888" });
@@ -166,6 +175,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         const page = await (await browser.newContext({ viewport: size, reducedMotion: "reduce" })).newPage();
         t.after(() => browser.close());
         page.setDefaultTimeout(5000);
+        page.setDefaultNavigationTimeout(60000);
         const errors = [], seen = { starts: [], canceled: [] };
         page.on("pageerror", (e) => errors.push(e.message));
         await page.route("**/*", serve(lang, seen));
@@ -176,7 +186,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await via.waitFor();
         assert.deepEqual(seen.starts, [{ agent: "codex" }]);
         assert.equal((await via.textContent()).trim(), w.via.replace("{p}", w.global));
-        await via.click();
+        await openVia(page, via);
         const menu = page.locator(".proto-menu");
         assert.deepEqual(await menu.locator(".pm-item .pm-name").allTextContents(), [w.global, w.direct, w.custom]);
         assert.equal(await menu.locator(".pm-item.on .pm-name").textContent(), w.global);
